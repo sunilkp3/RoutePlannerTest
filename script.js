@@ -18,8 +18,10 @@ let leafletAutoFitRequested = true;
 let mappedFromStation = null;
 let mappedToStation = null;
 
-// Track selected departure train schedule index
+// Track selected departure train schedule index & timestamp
 let selectedTrainIndex = 0;
+let selectedTrainTimestamp = null; // Remembers exact departure time across refreshes
+
 const JOURNEY_REFRESH_INTERVAL_MS = 15000;
 const INSIDE_STATION_THRESHOLD_METERS = 200;
 
@@ -648,6 +650,9 @@ function renderUnselectedDualDirections(boardingStation) {
   });
 }
 
+/**
+ * Renders quick schedules bar while respecting user's previously selected schedule.
+ */
 function renderQuickSchedulesBar(platInfo, schedules) {
   const container = document.getElementById('quick-schedules-container');
   const list = document.getElementById('quick-schedules-list');
@@ -660,6 +665,25 @@ function renderQuickSchedulesBar(platInfo, schedules) {
   }
 
   const visibleSchedules = schedules.slice(0, 5);
+
+  // Preserve user selection by matching timestamps across periodic updates
+  if (selectedTrainTimestamp != null) {
+    // Look for a schedule departing within a 1-minute window of the stored timestamp
+    const matchIdx = visibleSchedules.findIndex(s => s.dateObj && Math.abs(s.dateObj.getTime() - selectedTrainTimestamp) < 60000);
+    if (matchIdx !== -1) {
+      selectedTrainIndex = matchIdx;
+    } else {
+      // If selected train has already departed, auto-advance to the next immediate upcoming train
+      selectedTrainIndex = 0;
+      if (visibleSchedules[0] && visibleSchedules[0].dateObj) {
+        selectedTrainTimestamp = visibleSchedules[0].dateObj.getTime();
+      }
+    }
+  } else if (visibleSchedules[0] && visibleSchedules[0].dateObj) {
+    selectedTrainIndex = 0;
+    selectedTrainTimestamp = visibleSchedules[0].dateObj.getTime();
+  }
+
   list.innerHTML = '';
 
   visibleSchedules.forEach((schedule, idx) => {
@@ -671,6 +695,9 @@ function renderQuickSchedulesBar(platInfo, schedules) {
 
     chip.addEventListener('click', () => {
       selectedTrainIndex = idx;
+      if (schedule.dateObj) {
+        selectedTrainTimestamp = schedule.dateObj.getTime(); // Lock timestamp on click
+      }
       document.querySelectorAll('.quick-schedule-chip').forEach((c, i) => {
         c.classList.toggle('active', i === idx);
       });
@@ -908,8 +935,18 @@ function calculateRoute(isGpsUpdate = false) {
     return;
   }
 
+  // Check if route endpoints actually changed
+  const routeChanged = !currentRoutePath || currentRoutePath.length === 0 || 
+                       currentRoutePath[0] !== start || 
+                       currentRoutePath[currentRoutePath.length - 1] !== end;
+
   currentRoutePath = path;
-  selectedTrainIndex = 0;
+
+  // ONLY reset selection if the user actually selected a new route!
+  if (routeChanged && !isGpsUpdate) {
+    selectedTrainIndex = 0;
+    selectedTrainTimestamp = null;
+  }
 
   if (!isGpsUpdate) requestLeafletAutoFit(true);
 
@@ -961,6 +998,7 @@ function updateRouteFromInputs(isDynamicUpdate = false) {
 
   currentPanel = 'unselected';
   currentRoutePath = [];
+  selectedTrainTimestamp = null;
   const quickContainer = document.getElementById('quick-schedules-container');
   if (quickContainer) quickContainer.style.display = 'none';
 
@@ -971,6 +1009,7 @@ function updateRouteFromInputs(isDynamicUpdate = false) {
 function showBoardingDirections() {
   currentPanel = 'unselected';
   currentRoutePath = [];
+  selectedTrainTimestamp = null;
   updatePanelVisibility();
 
   const fromInput = document.getElementById('from-input');
@@ -987,7 +1026,7 @@ function syncFromFieldWithLiveLocation(nearestStation, shouldUpdateRoute = true)
   if (fromStationSource !== 'live' || !nearestStation) return false;
 
   fromInput.value = nearestStation;
-  fromClear.style.display = 'flex';
+  if (fromClear) fromClear.style.display = 'none';
 
   if (shouldUpdateRoute) {
     renderUnselectedDualDirections(nearestStation);
@@ -1115,7 +1154,10 @@ function setFromStationSource(source) {
     fromInput.readOnly = false;
     fromInput.placeholder = isLive ? 'Auto-filled from GPS or search place...' : 'Search starting place or station...';
   }
-  if (fromClear) fromClear.style.display = fromInput?.value.trim() ? 'flex' : 'none';
+
+  if (fromClear) {
+    fromClear.style.display = (isLive || !fromInput?.value.trim()) ? 'none' : 'flex';
+  }
 }
 
 function updateMapStats() {
@@ -1420,6 +1462,10 @@ function setupAutocomplete(inputId, resultsId, helperId) {
   if (!input || !results || !clearBtn) return;
 
   function updateClearButton() {
+    if (inputId === 'from-input' && fromStationSource === 'live') {
+      clearBtn.style.display = 'none';
+      return;
+    }
     clearBtn.style.display = input.value.trim() ? 'flex' : 'none';
   }
 
@@ -1544,12 +1590,10 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 
     if (inputId === 'from-input') {
       if (fromStationSource === 'live') {
-        // Instant restore if cleared by mistake while Live Location is ON
         if (currentNearestStation) {
           syncFromFieldWithLiveLocation(currentNearestStation, true);
           return;
         } else {
-          // Trigger an immediate fast location request if cache is empty
           const statusDiv = document.getElementById('gps-status');
           if (statusDiv) statusDiv.innerText = 'Fetching current location...';
           if ('geolocation' in navigator) {
@@ -1562,6 +1606,13 @@ function setupAutocomplete(inputId, resultsId, helperId) {
             );
           }
           return;
+        }
+      } else if (currentNearestStation) {
+        const statusDiv = document.getElementById('gps-status');
+        if (statusDiv) {
+          const isInside = currentNearestStationDistanceMeters != null && currentNearestStationDistanceMeters <= INSIDE_STATION_THRESHOLD_METERS;
+          const statusText = isInside ? 'You are at' : 'Approaching';
+          statusDiv.innerHTML = `${statusText} <strong>${currentNearestStation}</strong> (${getDistanceLabel(currentNearestStationDistanceMeters)} away).`;
         }
       }
     }
@@ -1609,7 +1660,7 @@ function updateLiveClock() {
 function refreshJourneyView() {
   if (currentRoutePath && currentRoutePath.length > 1) {
     renderMetroMap();
-    updateCurrentRouteScheduleFromSelection();
+    refreshSelectedRouteJourney(); // Refresh schedule directly without wiping route state
   }
 
   if ('geolocation' in navigator && isTracking) {
