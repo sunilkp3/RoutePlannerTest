@@ -1078,10 +1078,7 @@ function applyDetectedPosition(position, statusDiv) {
 
     // Check if the 'To' station field already contains a value
     const destination = normalizeStationName(toInput?.value || '');
-    const isToFilled = destination && STATIONS[destination];
-
-    if (fromStationSource === 'live' && !isToFilled) {
-      // Only auto-update the 'From' field if 'To' is NOT filled
+    if (fromStationSource === 'live') {
       syncFromFieldWithLiveLocation(nearestStation, false);
       renderUnselectedDualDirections(nearestStation);
       updateRouteFromInputs(true);
