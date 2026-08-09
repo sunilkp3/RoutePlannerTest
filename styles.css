@@ -1,3 +1,8 @@
+/* Prevent Mobile Input Focus Zoom & Scaling Shifts */
+html {
+  -webkit-text-size-adjust: 100%;
+  touch-action: manipulation;
+}
 :root {
   color-scheme: dark;
   --bg: #05070b;
@@ -893,4 +898,13 @@ footer a:hover, footer a:focus { text-decoration: underline; }
   .map-live-pill { align-self: flex-start; }
   .metric-card .val { font-size: 0.95rem; }
   .metric-card .lbl { font-size: 0.65rem; }
+}
+
+/* Force 16px input size only on mobile/touch screens to prevent zoom */
+@media (pointer: coarse), (max-width: 1024px) {
+  input[type="text"],
+  input {
+    font-size: 16px !important;
+    touch-action: manipulation;
+  }
 }
