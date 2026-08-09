@@ -13,8 +13,6 @@ let lastLeafletRenderKey = '';
 let leafletUserTouched = false;
 let leafletProgrammaticFit = false;
 let leafletAutoFitRequested = true;
-let suppressLiveAutoFillUntilBlur = false;
-let fromInputIdleAutoFillTimer = null;
 
 // Track selected mapped station objects for From/To if a landmark was chosen
 let mappedFromStation = null;
@@ -23,6 +21,7 @@ let mappedToStation = null;
 // Track selected departure train schedule index
 let selectedTrainIndex = 0;
 const JOURNEY_REFRESH_INTERVAL_MS = 15000;
+const INSIDE_STATION_THRESHOLD_METERS = 200;
 
 const STATIONS = {
   // PURPLE LINE
@@ -204,6 +203,10 @@ const ADJACENCY = {
 };
 
 const STATION_ALIASES = {
+  "Whitefield": "Whitefield (Kadugodi)",
+  "Whitefield (Kadugodi)": "Whitefield (Kadugodi)",
+  "Whitefield Kadugodi": "Whitefield (Kadugodi)",
+  "Kadugodi": "Whitefield (Kadugodi)",
   "Rajarajeswari Nagar": "Rajarajeshwari Nagar",
   "Nallurhalli": "Nallur Halli",
   "Nallur Halli": "Nallur Halli",
@@ -290,6 +293,7 @@ const BMRC_TIMETABLES = {
 
 // Distance Utilities (Haversine Formula)
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
+  if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return Infinity;
   const R = 6371; // Earth radius in KM
   const dLat = (lat2 - lat1) * Math.PI / 180;
   const dLon = (lon2 - lon1) * Math.PI / 180;
@@ -301,6 +305,7 @@ function getDistanceInKm(lat1, lon1, lat2, lon2) {
 }
 
 function getDistanceLabel(distanceMeters) {
+  if (distanceMeters == null || isNaN(distanceMeters)) return '-- m';
   if (distanceMeters >= 1000) {
     return `${(distanceMeters / 1000).toFixed(1)} km`;
   }
@@ -308,11 +313,12 @@ function getDistanceLabel(distanceMeters) {
 }
 
 function findNearestStationForCoordinates(lat, lng) {
+  if (lat == null || lng == null) return null;
   let nearestStation = null;
   let minDistance = Infinity;
 
   for (const [station, coords] of Object.entries(STATIONS)) {
-    if (!coords.lat || !coords.lng) continue;
+    if (!coords || coords.lat == null || coords.lng == null) continue;
     const dist = getDistanceInKm(lat, lng, coords.lat, coords.lng);
     if (dist < minDistance) {
       minDistance = dist;
@@ -323,25 +329,39 @@ function findNearestStationForCoordinates(lat, lng) {
   return nearestStation ? { station: nearestStation, distanceMeters: minDistance * 1000 } : null;
 }
 
-// OpenStreetMap Nominatim Geocoding API Search
-async function searchOSMPlaces(query) {
-  if (!query || query.trim().length < 3) return [];
+// Helper to determine station proximity tag
+function getLiveStatusTag(station) {
+  if (currentNearestStation !== station) return '';
+  const dist = currentNearestStationDistanceMeters != null ? currentNearestStationDistanceMeters : Infinity;
+  if (dist <= INSIDE_STATION_THRESHOLD_METERS) {
+    return '<span class="live-tag">YOU ARE HERE</span>';
+  } else {
+    return '<span class="live-tag approaching">APPROACHING</span>';
+  }
+}
 
-  // Bounding box for Bengaluru: min_lon, min_lat, max_lon, max_lat
-  const viewbox = "77.35,13.15,77.85,12.75";
-  const url = `https://nominatim.openstreetmap.org/search?` +
-    `format=json` +
-    `&q=${encodeURIComponent(query + ", Bengaluru")}` +
-    `&countrycodes=in` +
-    `&viewbox=${viewbox}` +
-    `&bounded=1` +
-    `&limit=5`;
+/**
+ * Search OpenStreetMap Places via Nominatim.
+ * @param {string} query Search string
+ * @param {boolean} restrictToBengaluru If true, bounds strictly to Bengaluru; if false, searches nationwide across all districts in India.
+ */
+async function searchOSMPlaces(query, restrictToBengaluru = true) {
+  if (!query || typeof query !== 'string' || query.trim().length < 3) return [];
+
+  let url = `https://nominatim.openstreetmap.org/search?format=json&limit=5&countrycodes=in`;
+
+  if (restrictToBengaluru) {
+    const viewbox = "77.35,13.15,77.85,12.75";
+    url += `&q=${encodeURIComponent(query + ", Bengaluru")}&viewbox=${viewbox}&bounded=1`;
+  } else {
+    url += `&q=${encodeURIComponent(query)}`;
+  }
 
   try {
     const response = await fetch(url, { headers: { "Accept-Language": "en" } });
-    if (!response.ok) return [];
+    if (!response || !response.ok) return [];
     const results = await response.json();
-    return results;
+    return Array.isArray(results) ? results : [];
   } catch (err) {
     console.error("OSM Geocoding Error:", err);
     return [];
@@ -357,6 +377,7 @@ function debounce(func, delay = 400) {
 }
 
 function shortMapLabel(name) {
+  if (!name || typeof name !== 'string') return '';
   return name
     .replace("Nadaprabhu Kempegowda (Majestic)", "Majestic")
     .replace("Rashtreeya Vidyalaya Road", "RV Road")
@@ -374,14 +395,25 @@ function shortMapLabel(name) {
 }
 
 function normalizeStationName(name) {
-  if (!name) return '';
-  // If user passed formatted landmark string like "Indiranagar (0.8 km from Commercial Street)", extract station name
-  const parenIdx = name.indexOf('(');
-  const cleanName = parenIdx > -1 ? name.substring(0, parenIdx).trim() : name.trim();
-  return STATION_ALIASES[cleanName] || cleanName;
+  if (!name || typeof name !== 'string') return '';
+  const trimmed = name.trim();
+  if (!trimmed) return '';
+
+  if (STATIONS && STATIONS[trimmed]) return trimmed;
+  if (STATION_ALIASES && STATION_ALIASES[trimmed]) return STATION_ALIASES[trimmed];
+
+  const parenIdx = trimmed.indexOf('(');
+  if (parenIdx > -1) {
+    const cleanName = trimmed.substring(0, parenIdx).trim();
+    if (STATIONS && STATIONS[cleanName]) return cleanName;
+    if (STATION_ALIASES && STATION_ALIASES[cleanName]) return STATION_ALIASES[cleanName];
+  }
+
+  return trimmed;
 }
 
 function minutesToTime(totalMinutes) {
+  if (totalMinutes == null || isNaN(totalMinutes)) return '00:00';
   const minutes = Math.round(totalMinutes);
   const h = Math.floor(minutes / 60) % 24;
   const m = minutes % 60;
@@ -389,6 +421,7 @@ function minutesToTime(totalMinutes) {
 }
 
 function getScheduleKey(date = new Date()) {
+  if (!date || !(date instanceof Date)) date = new Date();
   const day = date.getDay();
   if (day === 0) return "sunday";
   if (day === 1) return "monday";
@@ -397,6 +430,7 @@ function getScheduleKey(date = new Date()) {
 }
 
 function getDirectionKey(line, directionText) {
+  if (!line || !directionText || typeof directionText !== 'string') return null;
   if (line === "Purple Line") return directionText.includes("Whitefield") ? "toWhitefield" : "toChallaghatta";
   if (line === "Green Line") return directionText.includes("Silk Institute") ? "toSilkInstitute" : "toMadavara";
   if (line === "Yellow Line") return directionText.includes("Bommasandra") ? "toBommasandra" : "toRvRoad";
@@ -404,12 +438,19 @@ function getDirectionKey(line, directionText) {
 }
 
 function getLineForSegment(current, next) {
+  if (!current || !STATIONS[current]) return "Purple Line";
+  if (!next || !STATIONS[next]) return STATIONS[current].line || "Purple Line";
+
   if (STATIONS[current].line !== "Interchange") return STATIONS[current].line;
   if (STATIONS[next].line !== "Interchange") return STATIONS[next].line;
   return STATIONS[next].line || "Purple Line";
 }
 
 function getPlatformDetails(current, next) {
+  if (!current || !STATIONS[current] || !next || !STATIONS[next]) {
+    return { platform: "Platform 1", direction: "Towards Next Station", line: "Purple Line" };
+  }
+
   const line = getLineForSegment(current, next);
 
   if (current === "Nadaprabhu Kempegowda (Majestic)") {
@@ -456,17 +497,21 @@ function getPlatformDetails(current, next) {
 
 // Timetable Calculation Engines
 function getNextTrainArrival(routeInfo, offsetMinutes = 0) {
-  const directionText = typeof routeInfo === "string" ? routeInfo : routeInfo.direction;
-  const line = typeof routeInfo === "string" ? null : routeInfo.line;
+  if (!routeInfo) {
+    return { mins: "See BMRCL", minsNumeric: 0, detail: "Check BMRCL official timetable", dateObj: null, isAvailable: false };
+  }
+
+  const directionText = typeof routeInfo === "string" ? routeInfo : (routeInfo.direction || '');
+  const line = typeof routeInfo === "string" ? null : (routeInfo.line || null);
   const now = new Date();
   const hours = now.getHours();
   const minutes = now.getMinutes();
   const totalMins = hours * 60 + minutes + offsetMinutes;
-  const timetable = BMRC_TIMETABLES[line];
+  const timetable = line ? BMRC_TIMETABLES[line] : null;
   const directionKey = timetable ? getDirectionKey(line, directionText) : null;
   const bands = directionKey ? timetable[getScheduleKey(now)]?.[directionKey] : null;
 
-  if (!bands) {
+  if (!bands || !Array.isArray(bands)) {
     return { mins: "See BMRCL", minsNumeric: 0, detail: `Check BMRCL official timetable (${directionText})`, dateObj: null, isAvailable: false };
   }
 
@@ -493,8 +538,8 @@ function getNextTrainArrival(routeInfo, offsetMinutes = 0) {
 
   const upcomingBand = bands.find(([start]) => totalMins < start);
   if (!upcomingBand) {
-    const firstStart = minutesToTime(bands[0][0]);
-    const lastEnd = minutesToTime(bands[bands.length - 1][1]);
+    const firstStart = bands[0] ? minutesToTime(bands[0][0]) : '05:00';
+    const lastEnd = bands[bands.length - 1] ? minutesToTime(bands[bands.length - 1][1]) : '23:00';
     return { mins: "No Service", minsNumeric: 0, detail: `${line} ${directionText}: BMRCL timetable window is ${firstStart} - ${lastEnd}`, dateObj: null, isAvailable: false };
   }
 
@@ -518,8 +563,8 @@ function getMultipleUpcomingTrainArrivals(routeInfo, count = 3) {
 
   for (let i = 0; i < count; i++) {
     const schedule = getNextTrainArrival(routeInfo, cumulativeOffset);
-    if (!schedule.isAvailable) {
-      if (i === 0) results.push(schedule);
+    if (!schedule || !schedule.isAvailable) {
+      if (i === 0 && schedule) results.push(schedule);
       break;
     }
     results.push(schedule);
@@ -530,6 +575,9 @@ function getMultipleUpcomingTrainArrivals(routeInfo, count = 3) {
 }
 
 function findShortestPath(start, goal) {
+  if (!start || !goal || !STATIONS[start] || !STATIONS[goal]) return null;
+  if (start === goal) return [start];
+
   let queue = [[start]];
   let visited = new Set([start]);
 
@@ -549,20 +597,20 @@ function findShortestPath(start, goal) {
   return null;
 }
 
-// UI Render Functions
 function renderUnselectedDualDirections(boardingStation) {
   const container = document.getElementById('unselected-dual-container');
+  if (!container) return;
   container.innerHTML = '';
   currentPanel = 'unselected';
   currentRoutePath = [];
-  
+
   const quickContainer = document.getElementById('quick-schedules-container');
   if (quickContainer) quickContainer.style.display = 'none';
 
   updatePanelVisibility();
   renderMetroMap();
 
-  if (!STATIONS[boardingStation]) return;
+  if (!boardingStation || !STATIONS[boardingStation]) return;
 
   const line = STATIONS[boardingStation]?.line === "Interchange" ? "Purple Line" : STATIONS[boardingStation]?.line;
   let directions = [];
@@ -586,14 +634,15 @@ function renderUnselectedDualDirections(boardingStation) {
 
   directions.forEach(d => {
     const schedule = getNextTrainArrival({ direction: d.dir, line: d.line }, d.offset);
+    if (!schedule) return;
     const box = document.createElement('div');
     box.className = 'next-train-box';
     box.innerHTML = `
       <div>
         <div class="time-title">${d.label} • ${d.dir}</div>
-        <div class="time-sub">${schedule.detail}</div>
+        <div class="time-sub">${schedule.detail || ''}</div>
       </div>
-      <div class="time-val ${!schedule.isAvailable ? 'no-service' : ''}">${schedule.mins}</div>
+      <div class="time-val ${!schedule.isAvailable ? 'no-service' : ''}">${schedule.mins || 'N/A'}</div>
     `;
     container.appendChild(box);
   });
@@ -602,10 +651,10 @@ function renderUnselectedDualDirections(boardingStation) {
 function renderQuickSchedulesBar(platInfo, schedules) {
   const container = document.getElementById('quick-schedules-container');
   const list = document.getElementById('quick-schedules-list');
-  
+
   if (!container || !list) return;
 
-  if (!schedules || schedules.length === 0 || !schedules[0].isAvailable) {
+  if (!schedules || !Array.isArray(schedules) || schedules.length === 0 || !schedules[0]?.isAvailable) {
     container.style.display = 'none';
     return;
   }
@@ -614,11 +663,12 @@ function renderQuickSchedulesBar(platInfo, schedules) {
   list.innerHTML = '';
 
   visibleSchedules.forEach((schedule, idx) => {
+    if (!schedule) return;
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = `quick-schedule-chip ${idx === selectedTrainIndex ? 'active' : ''}`;
     chip.innerHTML = `🚆 in ${schedule.minsNumeric} min${schedule.minsNumeric > 1 ? 's' : ''}`;
-    
+
     chip.addEventListener('click', () => {
       selectedTrainIndex = idx;
       document.querySelectorAll('.quick-schedule-chip').forEach((c, i) => {
@@ -635,7 +685,13 @@ function renderQuickSchedulesBar(platInfo, schedules) {
 
 function renderSingleSelectedRouteTrain(platInfo, schedules) {
   const container = document.getElementById('single-route-train-container');
+  if (!container) return null;
   container.innerHTML = '';
+
+  if (!schedules || !Array.isArray(schedules) || schedules.length === 0) {
+    container.innerHTML = '<div class="next-train-box">No train schedule available.</div>';
+    return null;
+  }
 
   const visibleSchedules = schedules.slice(0, 5);
   const activeSchedule = visibleSchedules[selectedTrainIndex] || visibleSchedules[0];
@@ -650,12 +706,12 @@ function renderSingleSelectedRouteTrain(platInfo, schedules) {
   box.innerHTML = `
     <div>
       <div class="time-title">
-        ${platInfo.platform} • ${platInfo.direction}
+        ${platInfo?.platform || 'Platform'} • ${platInfo?.direction || 'Route'}
         <span class="live-tag">SELECTED TRAIN</span>
       </div>
-      <div class="time-sub">${activeSchedule.detail}</div>
+      <div class="time-sub">${activeSchedule.detail || ''}</div>
     </div>
-    <div class="time-val ${!activeSchedule.isAvailable ? 'no-service' : ''}">${activeSchedule.mins}</div>
+    <div class="time-val ${!activeSchedule.isAvailable ? 'no-service' : ''}">${activeSchedule.mins || 'N/A'}</div>
   `;
   container.appendChild(box);
 
@@ -664,7 +720,7 @@ function renderSingleSelectedRouteTrain(platInfo, schedules) {
 
 function refreshSelectedRouteJourney() {
   const path = currentRoutePath;
-  if (!path || path.length < 2) return;
+  if (!path || !Array.isArray(path) || path.length < 2) return;
 
   const firstPlatInfo = getPlatformDetails(path[0], path[1]);
   const schedules = getMultipleUpcomingTrainArrivals(firstPlatInfo, 5);
@@ -674,31 +730,36 @@ function refreshSelectedRouteJourney() {
 
 function updateRouteScheduleView(schedules) {
   const path = currentRoutePath;
-  if (!path || path.length < 2) return;
+  if (!path || !Array.isArray(path) || path.length < 2) return;
 
   const firstPlatInfo = getPlatformDetails(path[0], path[1]);
   const activeSchedule = renderSingleSelectedRouteTrain(firstPlatInfo, schedules);
 
   const noServiceBanner = document.getElementById('no-service-banner');
-  if (!activeSchedule || !activeSchedule.isAvailable) {
-    noServiceBanner.style.display = 'block';
-  } else {
-    noServiceBanner.style.display = 'none';
+  if (noServiceBanner) {
+    if (!activeSchedule || !activeSchedule.isAvailable) {
+      noServiceBanner.style.display = 'block';
+    } else {
+      noServiceBanner.style.display = 'none';
+    }
   }
 
   let runningTime = (activeSchedule && activeSchedule.dateObj) ? new Date(activeSchedule.dateObj.getTime()) : new Date();
 
   const timeline = document.getElementById('timeline');
+  if (!timeline) return;
   timeline.innerHTML = '';
 
   let currentLine = null;
 
   for (let i = 0; i < path.length; i++) {
     const station = path[i];
+    if (!station || !STATIONS[station]) continue;
+
     const isStart = i === 0;
     const isEnd = i === path.length - 1;
     const nextStation = path[i + 1];
-    const isLivePos = (currentNearestStation === station);
+    const liveTagHTML = getLiveStatusTag(station);
 
     if (i > 0) {
       const prevStation = path[i - 1];
@@ -712,7 +773,7 @@ function updateRouteScheduleView(schedules) {
       : `<span class="arrival-time-tag no-service-tag">No Service</span>`;
 
     let stepDiv = document.createElement('div');
-    stepDiv.className = 'step' + (isLivePos ? ' live-location-active' : '');
+    stepDiv.className = 'step' + (liveTagHTML ? ' live-location-active' : '');
 
     if (isStart) {
       const platInfo = getPlatformDetails(station, nextStation);
@@ -725,7 +786,7 @@ function updateRouteScheduleView(schedules) {
           <div class="step-header-row">
             <div class="step-title">
               Boarding at ${station}
-              ${isLivePos ? '<span class="live-tag">YOU ARE HERE</span>' : ''}
+              ${liveTagHTML}
             </div>
             ${timeTagHTML}
           </div>
@@ -741,7 +802,7 @@ function updateRouteScheduleView(schedules) {
           <div class="step-header-row">
             <div class="step-title">
               Arrive at ${station}
-              ${isLivePos ? '<span class="live-tag">YOU ARE HERE</span>' : ''}
+              ${liveTagHTML}
             </div>
             ${timeTagHTML}
           </div>
@@ -761,7 +822,7 @@ function updateRouteScheduleView(schedules) {
             <div class="step-header-row">
               <div class="step-title">
                 ${station}
-                ${isLivePos ? '<span class="live-tag">YOU ARE HERE</span>' : ''}
+                ${liveTagHTML}
               </div>
               ${timeTagHTML}
             </div>
@@ -775,7 +836,7 @@ function updateRouteScheduleView(schedules) {
             <div class="step-header-row">
               <div class="step-title">
                 Interchange at ${station}
-                ${isLivePos ? '<span class="live-tag">YOU ARE HERE</span>' : ''}
+                ${liveTagHTML}
               </div>
               ${timeTagHTML}
             </div>
@@ -792,7 +853,7 @@ function updateRouteScheduleView(schedules) {
           <div class="step-header-row">
             <div class="step-title">
               ${station}
-              ${isLivePos ? '<span class="live-tag">YOU ARE HERE</span>' : ''}
+              ${liveTagHTML}
             </div>
             ${timeTagHTML}
           </div>
@@ -806,18 +867,27 @@ function updateRouteScheduleView(schedules) {
 }
 
 function updatePanelVisibility() {
-  document.getElementById('map-card').style.display = activeView === 'map' ? 'block' : 'none';
-  document.getElementById('unselected-card').style.display = activeView === 'journey' && currentPanel === 'unselected' ? 'block' : 'none';
-  document.getElementById('result-card').style.display = activeView === 'journey' && currentPanel === 'result' ? 'block' : 'none';
-  document.getElementById('journey-view-btn').classList.toggle('active', activeView === 'journey');
-  document.getElementById('map-view-btn').classList.toggle('active', activeView === 'map');
+  const mapCard = document.getElementById('map-card');
+  const unselectedCard = document.getElementById('unselected-card');
+  const resultCard = document.getElementById('result-card');
+  const journeyBtn = document.getElementById('journey-view-btn');
+  const mapBtn = document.getElementById('map-view-btn');
+
+  if (mapCard) mapCard.style.display = activeView === 'map' ? 'block' : 'none';
+  if (unselectedCard) unselectedCard.style.display = activeView === 'journey' && currentPanel === 'unselected' ? 'block' : 'none';
+  if (resultCard) resultCard.style.display = activeView === 'journey' && currentPanel === 'result' ? 'block' : 'none';
+  if (journeyBtn) journeyBtn.classList.toggle('active', activeView === 'journey');
+  if (mapBtn) mapBtn.classList.toggle('active', activeView === 'map');
 }
 
 function calculateRoute(isGpsUpdate = false) {
-  const start = normalizeStationName(document.getElementById('from-input').value);
-  const end = normalizeStationName(document.getElementById('to-input').value);
+  const fromInput = document.getElementById('from-input');
+  const toInput = document.getElementById('to-input');
 
-  if (!STATIONS[start]) {
+  const start = normalizeStationName(fromInput ? fromInput.value : '');
+  const end = normalizeStationName(toInput ? toInput.value : '');
+
+  if (!start || !STATIONS[start]) {
     if (!isGpsUpdate) alert("Please select a valid boarding station or landmark from the search dropdown!");
     return;
   }
@@ -833,7 +903,11 @@ function calculateRoute(isGpsUpdate = false) {
   }
 
   const path = findShortestPath(start, end);
-  if (!path) return;
+  if (!path || !Array.isArray(path) || path.length < 2) {
+    if (!isGpsUpdate) alert("Unable to find a valid metro route between the selected stations.");
+    return;
+  }
+
   currentRoutePath = path;
   selectedTrainIndex = 0;
 
@@ -848,9 +922,13 @@ function calculateRoute(isGpsUpdate = false) {
   const estTimeMinutes = totalStops * 2.5 + (isInterchange ? 5 : 0);
   const calculatedFare = Math.min(90, Math.max(10, Math.ceil(totalStops * 5.2)));
 
-  document.getElementById('metric-fare').innerText = `₹${calculatedFare}`;
-  document.getElementById('metric-time').innerText = `~${Math.round(estTimeMinutes)} mins`;
-  document.getElementById('metric-stops').innerText = totalStops;
+  const metricFare = document.getElementById('metric-fare');
+  const metricTime = document.getElementById('metric-time');
+  const metricStops = document.getElementById('metric-stops');
+
+  if (metricFare) metricFare.innerText = `₹${calculatedFare}`;
+  if (metricTime) metricTime.innerText = `~${Math.round(estTimeMinutes)} mins`;
+  if (metricStops) metricStops.innerText = totalStops;
 
   const firstPlatInfo = getPlatformDetails(path[0], path[1]);
   const schedules = getMultipleUpcomingTrainArrivals(firstPlatInfo, 5);
@@ -860,20 +938,23 @@ function calculateRoute(isGpsUpdate = false) {
 }
 
 function updateCurrentRouteScheduleFromSelection() {
-  if (!currentRoutePath || currentRoutePath.length < 2) return;
+  if (!currentRoutePath || !Array.isArray(currentRoutePath) || currentRoutePath.length < 2) return;
   refreshSelectedRouteJourney();
 }
 
 function updateRouteFromInputs(isDynamicUpdate = false) {
-  const start = normalizeStationName(document.getElementById('from-input').value);
-  const end = normalizeStationName(document.getElementById('to-input').value);
+  const fromInput = document.getElementById('from-input');
+  const toInput = document.getElementById('to-input');
 
-  if (STATIONS[start] && STATIONS[end] && start !== end) {
+  const start = normalizeStationName(fromInput ? fromInput.value : '');
+  const end = normalizeStationName(toInput ? toInput.value : '');
+
+  if (start && end && STATIONS[start] && STATIONS[end] && start !== end) {
     calculateRoute(isDynamicUpdate);
     return;
   }
 
-  if (STATIONS[start]) {
+  if (start && STATIONS[start]) {
     showBoardingDirections();
     return;
   }
@@ -892,23 +973,10 @@ function showBoardingDirections() {
   currentRoutePath = [];
   updatePanelVisibility();
 
-  const currentFrom = normalizeStationName(document.getElementById('from-input').value);
-  if (currentFrom) renderUnselectedDualDirections(currentFrom);
+  const fromInput = document.getElementById('from-input');
+  const currentFrom = normalizeStationName(fromInput ? fromInput.value : '');
+  if (currentFrom && STATIONS[currentFrom]) renderUnselectedDualDirections(currentFrom);
   renderMetroMap();
-}
-
-// GPS & Map Engine Functions
-function getLocationErrorMessage(error) {
-  switch (error?.code) {
-    case error?.PERMISSION_DENIED:
-      return "Location access was blocked. Please allow location permission for this site in your browser and refresh the page.";
-    case error?.POSITION_UNAVAILABLE:
-      return "Your location could not be determined right now. Please try again or select a station manually.";
-    case error?.TIMEOUT:
-      return "Location detection timed out. Please try again or choose a station manually.";
-    default:
-      return "Location detection failed. Please try again or select a station manually.";
-  }
 }
 
 function syncFromFieldWithLiveLocation(nearestStation, shouldUpdateRoute = true) {
@@ -916,8 +984,7 @@ function syncFromFieldWithLiveLocation(nearestStation, shouldUpdateRoute = true)
   const fromClear = document.getElementById('from-clear');
   if (!fromInput || !fromClear) return false;
 
-  const hasManualSelection = Boolean(fromInput.value.trim() && STATIONS[normalizeStationName(fromInput.value)]);
-  if (fromStationSource !== 'live' || hasManualSelection || !nearestStation) return false;
+  if (fromStationSource !== 'live' || !nearestStation) return false;
 
   fromInput.value = nearestStation;
   fromClear.style.display = 'flex';
@@ -934,21 +1001,26 @@ function updateLiveDistanceStatus(distanceLabel, nearestStation) {
   const statusDiv = document.getElementById('gps-status');
   if (!statusDiv) return;
   if (nearestStation) {
-    statusDiv.innerHTML = `Live location detected the nearest metro station as <strong>${nearestStation}</strong> (${distanceLabel} away).`;
+    const isInside = currentNearestStationDistanceMeters != null && currentNearestStationDistanceMeters <= INSIDE_STATION_THRESHOLD_METERS;
+    const statusText = isInside ? 'You are at' : 'Approaching';
+    statusDiv.innerHTML = `${statusText} <strong>${nearestStation}</strong> (${distanceLabel} away).`;
   } else {
-    statusDiv.innerHTML = `Live location detected your current position, but no nearby metro station was found.`;
+    statusDiv.innerHTML = `Live location active, searching for nearest metro station...`;
   }
 }
 
 function applyDetectedPosition(position, statusDiv) {
+  if (!position || !position.coords) return;
   const userLat = position.coords.latitude;
   const userLng = position.coords.longitude;
+
+  if (userLat == null || userLng == null) return;
 
   let nearestStation = null;
   let minDistance = Infinity;
 
   for (const [station, coords] of Object.entries(STATIONS)) {
-    if (!coords.lat || !coords.lng) continue;
+    if (!coords || coords.lat == null || coords.lng == null) continue;
     const dist = getDistanceInKm(userLat, userLng, coords.lat, coords.lng);
     if (dist < minDistance) {
       minDistance = dist;
@@ -964,33 +1036,19 @@ function applyDetectedPosition(position, statusDiv) {
 
     const fromInput = document.getElementById('from-input');
     const toInput = document.getElementById('to-input');
-    const fromValue = normalizeStationName(fromInput?.value || '');
-    const toValue = normalizeStationName(toInput?.value || '');
-    const hasManualFromSelection = Boolean(fromValue && STATIONS[fromValue]);
-    const hasSelectedRoute = Boolean(STATIONS[fromValue] && STATIONS[toValue] && fromValue !== toValue);
 
     if (fromStationSource === 'live') {
-      const appliedLiveValue = syncFromFieldWithLiveLocation(nearestStation, false);
-      if (nearestChanged || !hasManualFromSelection || appliedLiveValue) {
-        const destination = normalizeStationName(document.getElementById('to-input')?.value || '');
-        if (!STATIONS[destination]) renderUnselectedDualDirections(nearestStation);
-        updateRouteFromInputs(true);
-      }
-      if (hasManualFromSelection) {
-        statusDiv.innerHTML = `Live location nearby: <strong>${nearestStation}</strong> (${distanceLabel} away). Using your selected station.`;
-      } else {
-        updateLiveDistanceStatus(distanceLabel, nearestStation);
-      }
-    } else if (hasSelectedRoute) {
-      const statusMessage = `Live journey position: <strong>${nearestStation}</strong> (${distanceLabel} away). Current route still follows your selected trip.`;
-      if (statusDiv) statusDiv.innerHTML = statusMessage;
+      syncFromFieldWithLiveLocation(nearestStation, false);
+      const destination = normalizeStationName(toInput?.value || '');
+      if (!STATIONS[destination]) renderUnselectedDualDirections(nearestStation);
+      updateRouteFromInputs(true);
+      updateLiveDistanceStatus(distanceLabel, nearestStation);
     } else {
-      statusDiv.innerHTML = `Live location nearby: <strong>${nearestStation}</strong> (${distanceLabel} away). Using your selected station.`;
+      updateLiveDistanceStatus(distanceLabel, nearestStation);
     }
 
-    const shouldRefreshRouteView = nearestChanged || hasSelectedRoute;
-    if (shouldRefreshRouteView) {
-      renderMetroMap();
+    renderMetroMap();
+    if (nearestChanged || (fromInput?.value && toInput?.value)) {
       updateCurrentRouteScheduleFromSelection();
     }
   }
@@ -1000,14 +1058,12 @@ function startGPSLiveTracking() {
   const statusDiv = document.getElementById('gps-status');
 
   if (!('geolocation' in navigator)) {
-    setFromStationSource('manual');
-    statusDiv.innerText = 'GPS is not supported here. Search and select your boarding station or landmark manually.';
+    if (statusDiv) statusDiv.innerText = 'Live location data cannot be fetched due to lack of location permission.';
     return;
   }
 
   if (!window.isSecureContext && location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
-    setFromStationSource('manual');
-    statusDiv.innerText = 'Location detection needs a secure connection. Open this site over HTTPS or localhost, then allow location access.';
+    if (statusDiv) statusDiv.innerText = 'Live location data cannot be fetched due to lack of location permission.';
     return;
   }
 
@@ -1017,72 +1073,47 @@ function startGPSLiveTracking() {
   }
 
   isTracking = true;
-  statusDiv.innerText = 'Requesting location access...';
 
   const locationOptions = { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 };
   const handleSuccess = (position) => {
     applyDetectedPosition(position, statusDiv);
   };
-  const handleError = (err) => {
-    if (watchId !== null) {
-      navigator.geolocation.clearWatch(watchId);
-      watchId = null;
-    }
+  const handleError = () => {
     isTracking = false;
-    setFromStationSource('manual');
-    statusDiv.innerText = getLocationErrorMessage(err);
+    if (statusDiv) statusDiv.innerText = 'Live location data cannot be fetched due to lack of location permission.';
   };
 
-  navigator.geolocation.getCurrentPosition(handleSuccess, handleError, locationOptions);
-  watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, locationOptions);
-}
-
-function clearFromInputIdleAutoFillTimer() {
-  if (fromInputIdleAutoFillTimer) {
-    clearTimeout(fromInputIdleAutoFillTimer);
-    fromInputIdleAutoFillTimer = null;
+  try {
+    navigator.geolocation.getCurrentPosition(handleSuccess, handleError, locationOptions);
+    watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, locationOptions);
+  } catch (err) {
+    isTracking = false;
+    if (statusDiv) statusDiv.innerText = 'Live location data cannot be fetched due to lack of location permission.';
   }
-}
-
-function scheduleFromFieldLiveAutoFill() {
-  const fromInput = document.getElementById('from-input');
-  if (!fromInput) return;
-
-  clearFromInputIdleAutoFillTimer();
-
-  if (fromInput.value.trim()) return;
-
-  fromInputIdleAutoFillTimer = setTimeout(() => {
-    const activeFromValue = normalizeStationName(fromInput.value || '');
-    if (activeFromValue) return;
-
-    if (!('geolocation' in navigator)) return;
-
-    setFromStationSource('live');
-    if (currentNearestStation) {
-      syncFromFieldWithLiveLocation(currentNearestStation, true);
-    } else {
-      startGPSLiveTracking();
-    }
-  }, 10000);
 }
 
 function setFromStationSource(source) {
   fromStationSource = source;
   const fromInput = document.getElementById('from-input');
   const fromClear = document.getElementById('from-clear');
+  const toggleCheckbox = document.getElementById('location-toggle');
+  const toggleLabel = document.getElementById('toggle-mode-label');
+
   const isLive = source === 'live';
+
+  if (toggleCheckbox) toggleCheckbox.checked = isLive;
+  if (toggleLabel) toggleLabel.innerText = isLive ? 'Live Location' : 'Manual Entry';
 
   const sourceHelper = document.getElementById('from-source-helper');
   if (sourceHelper) {
     sourceHelper.innerText = isLive
-      ? 'Type any station or place in Bengaluru — we will auto-fill the nearest station.'
-      : 'You can search and choose a station or landmark manually.';
+      ? 'Type any station or place across India — we will auto-fill the nearest Bengaluru metro station.'
+      : 'Search and choose your boarding station or landmark manually.';
   }
 
   if (fromInput) {
     fromInput.readOnly = false;
-    fromInput.placeholder = 'Search starting place or station...';
+    fromInput.placeholder = isLive ? 'Auto-filled from GPS or search place...' : 'Search starting place or station...';
   }
   if (fromClear) fromClear.style.display = fromInput?.value.trim() ? 'flex' : 'none';
 }
@@ -1092,7 +1123,7 @@ function updateMapStats() {
   const linesStat = document.getElementById('map-lines-stat');
   if (!stopsStat || !linesStat) return;
 
-  if (currentRoutePath.length < 2) {
+  if (!currentRoutePath || !Array.isArray(currentRoutePath) || currentRoutePath.length < 2) {
     stopsStat.textContent = '-- stops';
     linesStat.textContent = 'Overview';
     return;
@@ -1121,8 +1152,9 @@ function setActiveView(view) {
 }
 
 function stationLatLng(stationName) {
+  if (!stationName || !STATIONS[stationName]) return null;
   const station = STATIONS[stationName];
-  return station ? [station.lat, station.lng] : null;
+  return (station.lat != null && station.lng != null) ? [station.lat, station.lng] : null;
 }
 
 function canUseLeafletMap() {
@@ -1147,7 +1179,7 @@ function uniqueMapEdges() {
 }
 
 function getRouteLineAt(index) {
-  if (!currentRoutePath || currentRoutePath.length < 2) return 'Interchange';
+  if (!currentRoutePath || !Array.isArray(currentRoutePath) || currentRoutePath.length < 2) return 'Interchange';
 
   const stationName = currentRoutePath[index];
   const nextStation = currentRoutePath[index + 1];
@@ -1162,30 +1194,35 @@ function initLeafletMap() {
   if (!canUseLeafletMap()) return false;
   if (leafletMap) return true;
 
-  leafletMap = L.map('leaflet-map', {
-    zoomControl: true,
-    attributionControl: true
-  }).setView([12.9716, 77.5946], 11);
+  try {
+    leafletMap = L.map('leaflet-map', {
+      zoomControl: true,
+      attributionControl: true
+    }).setView([12.9716, 77.5946], 11);
 
-  const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    maxZoom: 19,
-    attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics'
-  });
+    const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19,
+      attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics'
+    });
 
-  const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
-  });
+    const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    });
 
-  street.addTo(leafletMap);
-  leafletBaseLayers = { 'Street map': street, 'Satellite': satellite };
-  L.control.layers(leafletBaseLayers, null, { position: 'topright' }).addTo(leafletMap);
-  leafletLayerGroup = L.layerGroup().addTo(leafletMap);
-  leafletMap.on('dragstart zoomstart', () => {
-    if (!leafletProgrammaticFit) leafletUserTouched = true;
-  });
-  setTimeout(() => leafletMap.invalidateSize(), 0);
-  return true;
+    street.addTo(leafletMap);
+    leafletBaseLayers = { 'Street map': street, 'Satellite': satellite };
+    L.control.layers(leafletBaseLayers, null, { position: 'topright' }).addTo(leafletMap);
+    leafletLayerGroup = L.layerGroup().addTo(leafletMap);
+    leafletMap.on('dragstart zoomstart', () => {
+      if (!leafletProgrammaticFit) leafletUserTouched = true;
+    });
+    setTimeout(() => { if (leafletMap) leafletMap.invalidateSize(); }, 0);
+    return true;
+  } catch (e) {
+    console.error("Leaflet initialization error:", e);
+    return false;
+  }
 }
 
 function renderLeafletMetroMap() {
@@ -1197,13 +1234,13 @@ function renderLeafletMetroMap() {
   if (htmlMap) htmlMap.style.display = 'none';
 
   updateMapStats();
-  leafletLayerGroup.clearLayers();
+  if (leafletLayerGroup) leafletLayerGroup.clearLayers();
 
   const summary = document.getElementById('map-summary');
   const livePill = document.getElementById('map-live-pill');
   const from = normalizeStationName(document.getElementById('from-input')?.value || '');
   const to = normalizeStationName(document.getElementById('to-input')?.value || '');
-  const isRouteMap = currentRoutePath.length > 1;
+  const isRouteMap = Array.isArray(currentRoutePath) && currentRoutePath.length > 1;
   const bounds = [];
   const routeEdgeKeys = new Set();
   const focusKey = isRouteMap ? `route:${currentRoutePath.join('|')}` : 'overview:network';
@@ -1250,7 +1287,7 @@ function renderLeafletMetroMap() {
     const station = STATIONS[stationName];
     if (!latLng || !station) return;
 
-    const routeIndex = currentRoutePath.indexOf(stationName);
+    const routeIndex = isRouteMap ? currentRoutePath.indexOf(stationName) : -1;
     const selected = routeIndex > -1;
     const lineName = selected ? getRouteLineAt(routeIndex) : station.line;
     const color = LINE_COLORS[lineName] || LINE_COLORS.Interchange;
@@ -1277,22 +1314,29 @@ function renderLeafletMetroMap() {
 
   if (currentNearestStation && STATIONS[currentNearestStation]) {
     const liveLatLng = stationLatLng(currentNearestStation);
-    const trainIcon = L.divIcon({
-      className: '',
-      html: '<div class="leaflet-train-marker">🚆</div>',
-      iconSize: [34, 28],
-      iconAnchor: [17, 14]
-    });
-    L.marker(liveLatLng, { icon: trainIcon, title: `Live nearest: ${currentNearestStation}`, zIndexOffset: 1000 })
-      .bindTooltip(`Live nearest: ${shortMapLabel(currentNearestStation)}`, {
-        direction: 'bottom',
-        offset: [0, 10],
-        opacity: 0.98,
-        permanent: true,
-        className: 'live-location-label'
-      })
-      .addTo(leafletLayerGroup);
-    bounds.push(liveLatLng);
+    if (liveLatLng) {
+      const isInside = currentNearestStationDistanceMeters != null && currentNearestStationDistanceMeters <= INSIDE_STATION_THRESHOLD_METERS;
+      const liveLabelText = isInside
+        ? `Live (You are here): ${shortMapLabel(currentNearestStation)}`
+        : `Live (Approaching): ${shortMapLabel(currentNearestStation)}`;
+
+      const trainIcon = L.divIcon({
+        className: '',
+        html: '<div class="leaflet-train-marker">🚆</div>',
+        iconSize: [34, 28],
+        iconAnchor: [17, 14]
+      });
+      L.marker(liveLatLng, { icon: trainIcon, title: liveLabelText, zIndexOffset: 1000 })
+        .bindTooltip(liveLabelText, {
+          direction: 'bottom',
+          offset: [0, 10],
+          opacity: 0.98,
+          permanent: true,
+          className: 'live-location-label'
+        })
+        .addTo(leafletLayerGroup);
+      bounds.push(liveLatLng);
+    }
   }
 
   if (summary) {
@@ -1300,13 +1344,18 @@ function renderLeafletMetroMap() {
       ? `${from} to ${to} • ${currentRoutePath.length - 1} stops highlighted`
       : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose places/stations to highlight your route.');
   }
-  if (livePill) livePill.textContent = currentNearestStation ? `Live: ${currentNearestStation}` : 'Live: waiting';
+  if (livePill) {
+    const isInside = currentNearestStationDistanceMeters != null && currentNearestStationDistanceMeters <= INSIDE_STATION_THRESHOLD_METERS;
+    livePill.textContent = currentNearestStation
+      ? (isInside ? `Live: ${currentNearestStation}` : `Approaching: ${currentNearestStation}`)
+      : 'Live: waiting';
+  }
 
   const focusBounds = isRouteMap ? currentRoutePath.map(stationLatLng).filter(Boolean) : bounds;
   const shouldAutoFitMap = activeView === 'map' && leafletAutoFitRequested && (!leafletUserTouched || isRouteMap);
 
   setTimeout(() => {
-    if (activeView !== 'map') return;
+    if (activeView !== 'map' || !leafletMap) return;
     if (!shouldAutoFitMap) {
       leafletAutoFitRequested = false;
       return;
@@ -1338,12 +1387,17 @@ function renderHtmlMetroMap() {
   container.innerHTML = `<div class="html-map-empty">Spatial HTML Fallback Map</div>`;
 
   if (summary) {
-    summary.textContent = currentRoutePath.length > 1
+    summary.textContent = (currentRoutePath && currentRoutePath.length > 1)
       ? `${from} to ${to} • ${currentRoutePath.length - 1} stops highlighted`
       : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose places/stations to highlight your route.');
   }
 
-  if (livePill) livePill.textContent = currentNearestStation ? `Live: ${currentNearestStation}` : 'Live: waiting';
+  if (livePill) {
+    const isInside = currentNearestStationDistanceMeters != null && currentNearestStationDistanceMeters <= INSIDE_STATION_THRESHOLD_METERS;
+    livePill.textContent = currentNearestStation
+      ? (isInside ? `Live: ${currentNearestStation}` : `Approaching: ${currentNearestStation}`)
+      : 'Live: waiting';
+  }
 }
 
 function renderMetroMap() {
@@ -1357,12 +1411,13 @@ function renderMetroMap() {
   renderHtmlMetroMap();
 }
 
-// Integrated Place & Station Autocomplete Logic
 function setupAutocomplete(inputId, resultsId, helperId) {
   const input = document.getElementById(inputId);
   const results = document.getElementById(resultsId);
   const helper = document.getElementById(helperId);
   const clearBtn = document.getElementById(inputId === 'from-input' ? 'from-clear' : 'to-clear');
+
+  if (!input || !results || !clearBtn) return;
 
   function updateClearButton() {
     clearBtn.style.display = input.value.trim() ? 'flex' : 'none';
@@ -1383,9 +1438,10 @@ function setupAutocomplete(inputId, resultsId, helperId) {
     const directStationMatches = stationNames.filter(name => name.toLowerCase().includes(qLower));
 
     directStationMatches.forEach(st => {
+      if (!STATIONS[st]) return;
       const item = document.createElement('div');
       item.className = 'autocomplete-item';
-      const lineType = STATIONS[st].line.split(' ')[0];
+      const lineType = STATIONS[st].line ? STATIONS[st].line.split(' ')[0] : 'Purple';
       item.innerHTML = `
         <div class="item-main-row">
           <span>🚆 ${st}</span>
@@ -1401,8 +1457,6 @@ function setupAutocomplete(inputId, resultsId, helperId) {
         updateClearButton();
 
         if (inputId === 'from-input') {
-          setFromStationSource('manual');
-          suppressLiveAutoFillUntilBlur = false;
           renderUnselectedDualDirections(st);
           if (helper) helper.innerText = `Boarding station set to ${st}.`;
         } else {
@@ -1418,11 +1472,13 @@ function setupAutocomplete(inputId, resultsId, helperId) {
       results.appendChild(item);
     });
 
-    // 2. Search OpenStreetMap Places in Bengaluru
+    // 2. Search OpenStreetMap Places (To-input = Bengaluru bounded; From-input = Nationwide)
     if (query.length >= 3) {
-      const places = await searchOSMPlaces(query);
+      const isToField = inputId === 'to-input';
+      const places = await searchOSMPlaces(query, isToField);
 
       places.forEach(place => {
+        if (!place || !place.lat || !place.lon) return;
         const lat = parseFloat(place.lat);
         const lon = parseFloat(place.lon);
         const match = findNearestStationForCoordinates(lat, lon);
@@ -1431,7 +1487,7 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 
         const { station, distanceMeters } = match;
         const distLabel = getDistanceLabel(distanceMeters);
-        const shortPlaceName = place.display_name.split(',').slice(0, 2).join(',');
+        const shortPlaceName = place.display_name ? place.display_name.split(',').slice(0, 2).join(',') : query;
 
         const item = document.createElement('div');
         item.className = 'autocomplete-item';
@@ -1444,14 +1500,12 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 
         item.addEventListener('mousedown', (e) => {
           e.preventDefault();
-          const placeTag = place.display_name.split(',')[0];
+          const placeTag = place.display_name ? place.display_name.split(',')[0] : query;
           input.value = `${station} (${distLabel} from ${placeTag})`;
           results.style.display = 'none';
           updateClearButton();
 
           if (inputId === 'from-input') {
-            setFromStationSource('manual');
-            suppressLiveAutoFillUntilBlur = false;
             renderUnselectedDualDirections(station);
             if (helper) helper.innerText = `Mapped from ${placeTag} → Boarding station: ${station} (~${distLabel} away).`;
           } else {
@@ -1477,13 +1531,6 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 
   input.addEventListener('focus', () => {
     if (!input.disabled && !input.readOnly) {
-      suppressLiveAutoFillUntilBlur = true;
-      if (inputId === 'from-input') {
-        setFromStationSource('manual');
-        if (!input.value.trim()) {
-          scheduleFromFieldLiveAutoFill();
-        }
-      }
       handleSearch();
     }
   });
@@ -1496,15 +1543,25 @@ function setupAutocomplete(inputId, resultsId, helperId) {
     updateClearButton();
 
     if (inputId === 'from-input') {
-      setFromStationSource('manual');
-      suppressLiveAutoFillUntilBlur = true;
-      scheduleFromFieldLiveAutoFill();
-      if (currentNearestStation) {
-        const statusDiv = document.getElementById('gps-status');
-        if (statusDiv) {
-          statusDiv.innerHTML = currentNearestStationDistanceMeters != null
-            ? `Live location detected the nearest metro station as <strong>${currentNearestStation}</strong> (${getDistanceLabel(currentNearestStationDistanceMeters)} away).`
-            : `Live location is available.`;
+      if (fromStationSource === 'live') {
+        // Instant restore if cleared by mistake while Live Location is ON
+        if (currentNearestStation) {
+          syncFromFieldWithLiveLocation(currentNearestStation, true);
+          return;
+        } else {
+          // Trigger an immediate fast location request if cache is empty
+          const statusDiv = document.getElementById('gps-status');
+          if (statusDiv) statusDiv.innerText = 'Fetching current location...';
+          if ('geolocation' in navigator) {
+            navigator.geolocation.getCurrentPosition(
+              (pos) => applyDetectedPosition(pos, statusDiv),
+              () => {
+                if (statusDiv) statusDiv.innerText = 'Live location data cannot be fetched due to lack of location permission.';
+              },
+              { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+            );
+          }
+          return;
         }
       }
     }
@@ -1521,14 +1578,8 @@ function setupAutocomplete(inputId, resultsId, helperId) {
       const normalizedInput = normalizeStationName(input.value);
 
       if (inputId === 'from-input') {
-        clearFromInputIdleAutoFillTimer();
-        setFromStationSource('manual');
-        suppressLiveAutoFillUntilBlur = true;
-        if (input.value.trim()) {
-          suppressLiveAutoFillUntilBlur = false;
-          if (STATIONS[normalizedInput]) renderUnselectedDualDirections(normalizedInput);
-        } else {
-          scheduleFromFieldLiveAutoFill();
+        if (input.value.trim() && STATIONS[normalizedInput]) {
+          renderUnselectedDualDirections(normalizedInput);
         }
       }
 
@@ -1541,10 +1592,6 @@ function setupAutocomplete(inputId, resultsId, helperId) {
     setTimeout(() => {
       results.style.display = 'none';
       updateClearButton();
-      if (inputId === 'from-input' && !input.value.trim()) {
-        scheduleFromFieldLiveAutoFill();
-      }
-      suppressLiveAutoFillUntilBlur = false;
     }, 200);
   });
 
@@ -1552,17 +1599,20 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 }
 
 function updateLiveClock() {
-  const now = new Date();
-  document.getElementById('live-clock').innerText = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const clockEl = document.getElementById('live-clock');
+  if (clockEl) {
+    const now = new Date();
+    clockEl.innerText = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
 }
 
 function refreshJourneyView() {
-  if (currentRoutePath.length > 1) {
+  if (currentRoutePath && currentRoutePath.length > 1) {
     renderMetroMap();
     updateCurrentRouteScheduleFromSelection();
   }
 
-  if ('geolocation' in navigator && fromStationSource === 'live') {
+  if ('geolocation' in navigator && isTracking) {
     navigator.geolocation.getCurrentPosition(
       (position) => applyDetectedPosition(position, document.getElementById('gps-status')),
       () => {},
@@ -1575,6 +1625,23 @@ function refreshJourneyView() {
 document.addEventListener('DOMContentLoaded', () => {
   setupAutocomplete('from-input', 'from-results', 'from-source-helper');
   setupAutocomplete('to-input', 'to-results', 'to-source-helper');
+
+  // Set up Toggle Switch for Live Location / Manual Entry (Affects only From Station auto-fill)
+  const toggleCheckbox = document.getElementById('location-toggle');
+  if (toggleCheckbox) {
+    toggleCheckbox.checked = true; // Default ON
+    toggleCheckbox.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        setFromStationSource('live');
+        if (currentNearestStation) {
+          syncFromFieldWithLiveLocation(currentNearestStation, true);
+        }
+      } else {
+        setFromStationSource('manual');
+      }
+    });
+  }
+
   setFromStationSource('live');
   updatePanelVisibility();
   renderMetroMap();
@@ -1599,13 +1666,19 @@ document.addEventListener('DOMContentLoaded', () => {
     mapCard.style.display = 'none';
   }
 
-  document.getElementById('journey-view-btn').addEventListener('click', () => setActiveView('journey'));
-  document.getElementById('map-view-btn').addEventListener('click', () => setActiveView('map'));
+  const journeyBtn = document.getElementById('journey-view-btn');
+  const mapBtn = document.getElementById('map-view-btn');
+
+  if (journeyBtn) journeyBtn.addEventListener('click', () => setActiveView('journey'));
+  if (mapBtn) mapBtn.addEventListener('click', () => setActiveView('map'));
 
   setInterval(updateLiveClock, 1000);
   setInterval(refreshJourneyView, JOURNEY_REFRESH_INTERVAL_MS);
   updateLiveClock();
-  document.getElementById('year').innerText = new Date().getFullYear();
 
+  const yearEl = document.getElementById('year');
+  if (yearEl) yearEl.innerText = new Date().getFullYear();
+
+  // GPS tracking runs globally
   startGPSLiveTracking();
 });
