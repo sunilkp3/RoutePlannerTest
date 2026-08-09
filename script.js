@@ -6,17 +6,19 @@ let fromStationSource = 'live';
 let activeView = 'journey';
 let currentPanel = 'unselected';
 let currentRoutePath = [];
-let currentMapView = { x: 0, y: 0, width: 1100, height: 760 };
 let leafletMap = null;
 let leafletLayerGroup = null;
 let leafletBaseLayers = null;
-let lastLeafletFocusKey = '';
 let lastLeafletRenderKey = '';
 let leafletUserTouched = false;
 let leafletProgrammaticFit = false;
 let leafletAutoFitRequested = true;
 let suppressLiveAutoFillUntilBlur = false;
 let fromInputIdleAutoFillTimer = null;
+
+// Track selected mapped station objects for From/To if a landmark was chosen
+let mappedFromStation = null;
+let mappedToStation = null;
 
 // Track selected departure train schedule index
 let selectedTrainIndex = 0;
@@ -214,7 +216,7 @@ const STATION_ALIASES = {
   "Hebbagodi": "Biocon Hebbagodi",
   "Bommasandra": "Delta electronics Bommasandra",
   "Delta Electronics Bommasandra": "Delta electronics Bommasandra",
-  "Delta electronics Bommasandra": "Delta electronics Bommasandra"
+  "Majestic": "Nadaprabhu Kempegowda (Majestic)"
 };
 
 const stationNames = Object.keys(STATIONS).sort();
@@ -286,16 +288,72 @@ const BMRC_TIMETABLES = {
   }
 };
 
-// Helper Utilities
-function getMapPoint(stationName) {
-  const station = STATIONS[stationName];
-  const minLng = 77.45;
-  const maxLng = 77.77;
-  const minLat = 12.81;
-  const maxLat = 13.07;
-  const x = 70 + ((station.lng - minLng) / (maxLng - minLng)) * 960;
-  const y = 670 - ((station.lat - minLat) / (maxLat - minLat)) * 570;
-  return { x, y };
+// Distance Utilities (Haversine Formula)
+function getDistanceInKm(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth radius in KM
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function getDistanceLabel(distanceMeters) {
+  if (distanceMeters >= 1000) {
+    return `${(distanceMeters / 1000).toFixed(1)} km`;
+  }
+  return `${Math.round(distanceMeters)} m`;
+}
+
+function findNearestStationForCoordinates(lat, lng) {
+  let nearestStation = null;
+  let minDistance = Infinity;
+
+  for (const [station, coords] of Object.entries(STATIONS)) {
+    if (!coords.lat || !coords.lng) continue;
+    const dist = getDistanceInKm(lat, lng, coords.lat, coords.lng);
+    if (dist < minDistance) {
+      minDistance = dist;
+      nearestStation = station;
+    }
+  }
+
+  return nearestStation ? { station: nearestStation, distanceMeters: minDistance * 1000 } : null;
+}
+
+// OpenStreetMap Nominatim Geocoding API Search
+async function searchOSMPlaces(query) {
+  if (!query || query.trim().length < 3) return [];
+
+  // Bounding box for Bengaluru: min_lon, min_lat, max_lon, max_lat
+  const viewbox = "77.35,13.15,77.85,12.75";
+  const url = `https://nominatim.openstreetmap.org/search?` +
+    `format=json` +
+    `&q=${encodeURIComponent(query + ", Bengaluru")}` +
+    `&countrycodes=in` +
+    `&viewbox=${viewbox}` +
+    `&bounded=1` +
+    `&limit=5`;
+
+  try {
+    const response = await fetch(url, { headers: { "Accept-Language": "en" } });
+    if (!response.ok) return [];
+    const results = await response.json();
+    return results;
+  } catch (err) {
+    console.error("OSM Geocoding Error:", err);
+    return [];
+  }
+}
+
+function debounce(func, delay = 400) {
+  let timeout;
+  return (...args) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), delay);
+  };
 }
 
 function shortMapLabel(name) {
@@ -316,8 +374,11 @@ function shortMapLabel(name) {
 }
 
 function normalizeStationName(name) {
-  const trimmed = name.trim();
-  return STATION_ALIASES[trimmed] || trimmed;
+  if (!name) return '';
+  // If user passed formatted landmark string like "Indiranagar (0.8 km from Commercial Street)", extract station name
+  const parenIdx = name.indexOf('(');
+  const cleanName = parenIdx > -1 ? name.substring(0, parenIdx).trim() : name.trim();
+  return STATION_ALIASES[cleanName] || cleanName;
 }
 
 function minutesToTime(totalMinutes) {
@@ -757,17 +818,17 @@ function calculateRoute(isGpsUpdate = false) {
   const end = normalizeStationName(document.getElementById('to-input').value);
 
   if (!STATIONS[start]) {
-    if (!isGpsUpdate) alert("Please select a valid boarding station from the search dropdown!");
+    if (!isGpsUpdate) alert("Please select a valid boarding station or landmark from the search dropdown!");
     return;
   }
 
   if (!end || !STATIONS[end]) {
-    if (!isGpsUpdate) alert("Please select a valid destination station to calculate your journey!");
+    if (!isGpsUpdate) alert("Please select a valid destination station or landmark from the search dropdown!");
     return;
   }
 
   if (start === end) {
-    if (!isGpsUpdate) alert("Source and Destination cannot be the same!");
+    if (!isGpsUpdate) alert("Source and Destination cannot resolve to the same metro station!");
     return;
   }
 
@@ -837,24 +898,6 @@ function showBoardingDirections() {
 }
 
 // GPS & Map Engine Functions
-function getDistanceInKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = 
-    Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-    Math.sin(dLon/2) * Math.sin(dLon/2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-}
-
-function getDistanceLabel(distanceMeters) {
-  if (distanceMeters >= 1000) {
-    return `${(distanceMeters / 1000).toFixed(1)} km`;
-  }
-  return `${Math.round(distanceMeters)} m`;
-}
-
 function getLocationErrorMessage(error) {
   switch (error?.code) {
     case error?.PERMISSION_DENIED:
@@ -866,46 +909,6 @@ function getLocationErrorMessage(error) {
     default:
       return "Location detection failed. Please try again or select a station manually.";
   }
-}
-
-function findNearestStationForCoordinates(lat, lng) {
-  let nearestStation = null;
-  let minDistance = Infinity;
-
-  for (const [station, coords] of Object.entries(STATIONS)) {
-    if (!coords.lat || !coords.lng) continue;
-    const dist = getDistanceInKm(lat, lng, coords.lat, coords.lng);
-    if (dist < minDistance) {
-      minDistance = dist;
-      nearestStation = station;
-    }
-  }
-
-  return nearestStation ? { station: nearestStation, distanceMeters: minDistance * 1000 } : null;
-}
-
-function applyNearestStationToField(targetInputId, lat, lng, statusDiv, label) {
-  const match = findNearestStationForCoordinates(lat, lng);
-  if (!match) return false;
-
-  const targetInput = document.getElementById(targetInputId);
-  if (targetInput) {
-    targetInput.value = match.station;
-    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-
-  if (targetInputId === 'from-input') {
-    setFromStationSource('manual');
-    renderUnselectedDualDirections(match.station);
-  }
-
-  if (statusDiv) {
-    statusDiv.innerHTML = `${label} nearest metro station is <strong>${match.station}</strong> (${getDistanceLabel(match.distanceMeters)} away).`;
-  }
-
-  requestLeafletAutoFit(true);
-  updateRouteFromInputs(false);
-  return true;
 }
 
 function syncFromFieldWithLiveLocation(nearestStation, shouldUpdateRoute = true) {
@@ -998,7 +1001,7 @@ function startGPSLiveTracking() {
 
   if (!('geolocation' in navigator)) {
     setFromStationSource('manual');
-    statusDiv.innerText = 'GPS is not supported here. Search and select your boarding station manually.';
+    statusDiv.innerText = 'GPS is not supported here. Search and select your boarding station or landmark manually.';
     return;
   }
 
@@ -1034,14 +1037,6 @@ function startGPSLiveTracking() {
   watchId = navigator.geolocation.watchPosition(handleSuccess, handleError, locationOptions);
 }
 
-function stopGPSLiveTracking() {
-  if (watchId !== null && "geolocation" in navigator) {
-    navigator.geolocation.clearWatch(watchId);
-    watchId = null;
-  }
-  isTracking = false;
-}
-
 function clearFromInputIdleAutoFillTimer() {
   if (fromInputIdleAutoFillTimer) {
     clearTimeout(fromInputIdleAutoFillTimer);
@@ -1055,9 +1050,7 @@ function scheduleFromFieldLiveAutoFill() {
 
   clearFromInputIdleAutoFillTimer();
 
-  if (fromInput.value.trim()) {
-    return;
-  }
+  if (fromInput.value.trim()) return;
 
   fromInputIdleAutoFillTimer = setTimeout(() => {
     const activeFromValue = normalizeStationName(fromInput.value || '');
@@ -1080,16 +1073,12 @@ function setFromStationSource(source) {
   const fromClear = document.getElementById('from-clear');
   const isLive = source === 'live';
 
-  const toggle = document.getElementById('from-source-toggle');
-  if (toggle) toggle.checked = isLive;
-
-  const sourceLabel = document.getElementById('from-source-label');
-  if (sourceLabel) sourceLabel.innerText = isLive ? 'Live location auto-fill' : 'Manual station search';
-
   const sourceHelper = document.getElementById('from-source-helper');
-  if (sourceHelper) sourceHelper.innerText = isLive
-    ? 'We will auto-fill the nearest metro station from your location when you have not selected one manually.'
-    : 'You can search and choose a station manually; live location will not override it.';
+  if (sourceHelper) {
+    sourceHelper.innerText = isLive
+      ? 'Type any station or place in Bengaluru — we will auto-fill the nearest station.'
+      : 'You can search and choose a station or landmark manually.';
+  }
 
   if (fromInput) {
     fromInput.readOnly = false;
@@ -1180,7 +1169,7 @@ function initLeafletMap() {
 
   const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
     maxZoom: 19,
-    attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+    attribution: 'Tiles &copy; Esri, Maxar, Earthstar Geographics'
   });
 
   const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -1308,8 +1297,8 @@ function renderLeafletMetroMap() {
 
   if (summary) {
     summary.textContent = isRouteMap
-      ? `${from} to ${to} • ${currentRoutePath.length - 1} stops highlighted on real map`
-      : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose stations to highlight your route.');
+      ? `${from} to ${to} • ${currentRoutePath.length - 1} stops highlighted`
+      : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose places/stations to highlight your route.');
   }
   if (livePill) livePill.textContent = currentNearestStation ? `Live: ${currentNearestStation}` : 'Live: waiting';
 
@@ -1326,7 +1315,6 @@ function renderLeafletMetroMap() {
     leafletProgrammaticFit = true;
     leafletAutoFitRequested = false;
     leafletUserTouched = false;
-    lastLeafletFocusKey = focusKey;
     if (focusBounds.length) {
       leafletMap.fitBounds(focusBounds, { animate: false, padding: isRouteMap ? [18, 18] : [28, 28], maxZoom: isRouteMap ? 16 : 12 });
     } else {
@@ -1352,7 +1340,7 @@ function renderHtmlMetroMap() {
   if (summary) {
     summary.textContent = currentRoutePath.length > 1
       ? `${from} to ${to} • ${currentRoutePath.length - 1} stops highlighted`
-      : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose stations to highlight your route.');
+      : (STATIONS[from] ? `Boarding station selected: ${from}` : 'Allow GPS or choose places/stations to highlight your route.');
   }
 
   if (livePill) livePill.textContent = currentNearestStation ? `Live: ${currentNearestStation}` : 'Live: waiting';
@@ -1369,32 +1357,41 @@ function renderMetroMap() {
   renderHtmlMetroMap();
 }
 
-function setupAutocomplete(inputId, resultsId) {
+// Integrated Place & Station Autocomplete Logic
+function setupAutocomplete(inputId, resultsId, helperId) {
   const input = document.getElementById(inputId);
   const results = document.getElementById(resultsId);
+  const helper = document.getElementById(helperId);
   const clearBtn = document.getElementById(inputId === 'from-input' ? 'from-clear' : 'to-clear');
 
   function updateClearButton() {
     clearBtn.style.display = input.value.trim() ? 'flex' : 'none';
   }
 
-  function renderResults(filterText = '') {
-    results.innerHTML = '';
-    const query = filterText.toLowerCase().trim();
-    const matches = stationNames.filter(name => name.toLowerCase().includes(query));
-
-    if (matches.length === 0) {
+  const handleSearch = debounce(async () => {
+    const query = input.value.trim();
+    if (query.length < 2) {
+      results.innerHTML = '';
       results.style.display = 'none';
       return;
     }
 
-    matches.forEach(st => {
+    results.innerHTML = '';
+    const qLower = query.toLowerCase();
+
+    // 1. Direct Metro Station Matches
+    const directStationMatches = stationNames.filter(name => name.toLowerCase().includes(qLower));
+
+    directStationMatches.forEach(st => {
       const item = document.createElement('div');
       item.className = 'autocomplete-item';
       const lineType = STATIONS[st].line.split(' ')[0];
       item.innerHTML = `
-        <span>${st}</span>
-        <span class="line-badge-sm ${lineType}">${lineType}</span>
+        <div class="item-main-row">
+          <span>🚆 ${st}</span>
+          <span class="line-badge-sm ${lineType}">${lineType}</span>
+        </div>
+        <span class="station-match-badge">Direct Metro Station</span>
       `;
 
       item.addEventListener('mousedown', (e) => {
@@ -1402,14 +1399,16 @@ function setupAutocomplete(inputId, resultsId) {
         input.value = st;
         results.style.display = 'none';
         updateClearButton();
-        
+
         if (inputId === 'from-input') {
           setFromStationSource('manual');
           suppressLiveAutoFillUntilBlur = false;
           renderUnselectedDualDirections(st);
+          if (helper) helper.innerText = `Boarding station set to ${st}.`;
         } else {
-          setFromStationSource('manual');
+          if (helper) helper.innerText = `Destination station set to ${st}.`;
         }
+
         requestLeafletAutoFit(true);
         updateRouteFromInputs(false);
         updateCurrentRouteScheduleFromSelection();
@@ -1419,8 +1418,62 @@ function setupAutocomplete(inputId, resultsId) {
       results.appendChild(item);
     });
 
-    results.style.display = 'block';
-  }
+    // 2. Search OpenStreetMap Places in Bengaluru
+    if (query.length >= 3) {
+      const places = await searchOSMPlaces(query);
+
+      places.forEach(place => {
+        const lat = parseFloat(place.lat);
+        const lon = parseFloat(place.lon);
+        const match = findNearestStationForCoordinates(lat, lon);
+
+        if (!match) return;
+
+        const { station, distanceMeters } = match;
+        const distLabel = getDistanceLabel(distanceMeters);
+        const shortPlaceName = place.display_name.split(',').slice(0, 2).join(',');
+
+        const item = document.createElement('div');
+        item.className = 'autocomplete-item';
+        item.innerHTML = `
+          <div class="item-main-row">
+            <span>📍 ${shortPlaceName}</span>
+          </div>
+          <span class="station-match-badge">Nearest: ${station} (~${distLabel} away)</span>
+        `;
+
+        item.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          const placeTag = place.display_name.split(',')[0];
+          input.value = `${station} (${distLabel} from ${placeTag})`;
+          results.style.display = 'none';
+          updateClearButton();
+
+          if (inputId === 'from-input') {
+            setFromStationSource('manual');
+            suppressLiveAutoFillUntilBlur = false;
+            renderUnselectedDualDirections(station);
+            if (helper) helper.innerText = `Mapped from ${placeTag} → Boarding station: ${station} (~${distLabel} away).`;
+          } else {
+            if (helper) helper.innerText = `Mapped to ${placeTag} → Destination station: ${station} (~${distLabel} away).`;
+          }
+
+          requestLeafletAutoFit(true);
+          updateRouteFromInputs(false);
+          updateCurrentRouteScheduleFromSelection();
+          input.blur();
+        });
+
+        results.appendChild(item);
+      });
+    }
+
+    if (results.children.length > 0) {
+      results.style.display = 'block';
+    } else {
+      results.style.display = 'none';
+    }
+  }, 350);
 
   input.addEventListener('focus', () => {
     if (!input.disabled && !input.readOnly) {
@@ -1431,14 +1484,17 @@ function setupAutocomplete(inputId, resultsId) {
           scheduleFromFieldLiveAutoFill();
         }
       }
-      renderResults(input.value);
+      handleSearch();
     }
   });
+
   clearBtn.addEventListener('mousedown', (e) => {
     e.preventDefault();
     input.value = '';
     results.style.display = 'none';
+    if (helper) helper.innerText = '';
     updateClearButton();
+
     if (inputId === 'from-input') {
       setFromStationSource('manual');
       suppressLiveAutoFillUntilBlur = true;
@@ -1448,19 +1504,22 @@ function setupAutocomplete(inputId, resultsId) {
         if (statusDiv) {
           statusDiv.innerHTML = currentNearestStationDistanceMeters != null
             ? `Live location detected the nearest metro station as <strong>${currentNearestStation}</strong> (${getDistanceLabel(currentNearestStationDistanceMeters)} away).`
-            : `Live location is available. The nearest metro station will be used when you do not select one manually.`;
+            : `Live location is available.`;
         }
       }
     }
+
     input.focus();
     requestLeafletAutoFit(true);
     updateRouteFromInputs(false);
   });
-  input.addEventListener('input', () => { 
+
+  input.addEventListener('input', () => {
     if (!input.disabled && !input.readOnly) {
       updateClearButton();
-      renderResults(input.value);
+      handleSearch();
       const normalizedInput = normalizeStationName(input.value);
+
       if (inputId === 'from-input') {
         clearFromInputIdleAutoFillTimer();
         setFromStationSource('manual');
@@ -1472,10 +1531,12 @@ function setupAutocomplete(inputId, resultsId) {
           scheduleFromFieldLiveAutoFill();
         }
       }
+
       if (STATIONS[normalizedInput]) requestLeafletAutoFit(true);
       updateRouteFromInputs(false);
     }
   });
+
   input.addEventListener('blur', () => {
     setTimeout(() => {
       results.style.display = 'none';
@@ -1484,8 +1545,9 @@ function setupAutocomplete(inputId, resultsId) {
         scheduleFromFieldLiveAutoFill();
       }
       suppressLiveAutoFillUntilBlur = false;
-    }, 150);
+    }, 200);
   });
+
   updateClearButton();
 }
 
@@ -1511,8 +1573,8 @@ function refreshJourneyView() {
 
 // Global Initialization
 document.addEventListener('DOMContentLoaded', () => {
-  setupAutocomplete('from-input', 'from-results');
-  setupAutocomplete('to-input', 'to-results');
+  setupAutocomplete('from-input', 'from-results', 'from-source-helper');
+  setupAutocomplete('to-input', 'to-results', 'to-source-helper');
   setFromStationSource('live');
   updatePanelVisibility();
   renderMetroMap();
