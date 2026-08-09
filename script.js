@@ -84,7 +84,7 @@ const STATIONS = {
   "Mantri Square Sampige Road": { line: "Green Line", order: 16, lat: 12.9905455, lng: 77.5708050 },
   "Chickpet": { line: "Green Line", order: 18, lat: 12.9675484, lng: 77.5747975 },
   "Krishna Rajendra Market": { line: "Green Line", order: 19, lat: 12.9564453, lng: 77.5735999 },
-  "National College": { line: "Green Line", order: 20, lat: 12.9506136, lng: 77.573360 },
+  "National College": { line: "Green Line", order: 20, lat: 12.9506136, lng: 77.5737360 },
   "Lalbagh": { line: "Green Line", order: 21, lat: 12.9462868, lng: 77.5800613 },
   "South End Circle": { line: "Green Line", order: 22, lat: 12.9383210, lng: 77.5800747 },
   "Jayanagar": { line: "Green Line", order: 23, lat: 12.9294558, lng: 77.5802873 },
@@ -1020,13 +1020,8 @@ function showBoardingDirections() {
 
 function syncFromFieldWithLiveLocation(nearestStation, shouldUpdateRoute = true) {
   const fromInput = document.getElementById('from-input');
-  const toInput = document.getElementById('to-input');
   const fromClear = document.getElementById('from-clear');
   if (!fromInput || !fromClear) return false;
-
-  // RULE 1: Do NOT update 'From' field if 'To' station is selected or filled
-  const hasToSelection = Boolean(toInput && toInput.value.trim() !== '');
-  if (hasToSelection) return false;
 
   if (fromStationSource !== 'live' || !nearestStation) return false;
 
@@ -1081,18 +1076,20 @@ function applyDetectedPosition(position, statusDiv) {
     const fromInput = document.getElementById('from-input');
     const toInput = document.getElementById('to-input');
 
-    // RULE 1: Do NOT update 'From' field when 'To' station is selected
-    const hasToSelection = Boolean(toInput && toInput.value.trim() !== '');
+    // Check if the 'To' station field already contains a value
+    const destination = normalizeStationName(toInput?.value || '');
+    const isToFilled = destination && STATIONS[destination];
 
-    if (fromStationSource === 'live' && !hasToSelection) {
-      // Only auto-update the 'From' field if 'To' is NOT selected
+    if (fromStationSource === 'live' && !isToFilled) {
+      // Only auto-update the 'From' field if 'To' is NOT filled
       syncFromFieldWithLiveLocation(nearestStation, false);
       renderUnselectedDualDirections(nearestStation);
       updateRouteFromInputs(true);
+      updateLiveDistanceStatus(distanceLabel, nearestStation);
+    } else {
+      // Update status text without overwriting the 'From' station field
+      updateLiveDistanceStatus(distanceLabel, nearestStation);
     }
-
-    // Always update status text without overwriting input fields
-    updateLiveDistanceStatus(distanceLabel, nearestStation);
 
     renderMetroMap();
     if (nearestChanged || (fromInput?.value && toInput?.value)) {
@@ -1142,7 +1139,6 @@ function startGPSLiveTracking() {
 function setFromStationSource(source) {
   fromStationSource = source;
   const fromInput = document.getElementById('from-input');
-  const toInput = document.getElementById('to-input');
   const fromClear = document.getElementById('from-clear');
   const toggleCheckbox = document.getElementById('location-toggle');
   const toggleLabel = document.getElementById('toggle-mode-label');
@@ -1599,13 +1595,10 @@ function setupAutocomplete(inputId, resultsId, helperId) {
 
     if (inputId === 'from-input') {
       if (fromStationSource === 'live') {
-        const toInput = document.getElementById('to-input');
-        const hasToSelection = Boolean(toInput && toInput.value.trim() !== '');
-
-        if (currentNearestStation && !hasToSelection) {
+        if (currentNearestStation) {
           syncFromFieldWithLiveLocation(currentNearestStation, true);
           return;
-        } else if (!hasToSelection) {
+        } else {
           const statusDiv = document.getElementById('gps-status');
           if (statusDiv) statusDiv.innerText = 'Fetching current location...';
           if ('geolocation' in navigator) {
@@ -1669,48 +1662,15 @@ function updateLiveClock() {
   }
 }
 
-// RULE 2: Every 15-second refresh updates ONLY non-input fields (telemetry, schedule, status badge, map)
 function refreshJourneyView() {
   if (currentRoutePath && currentRoutePath.length > 1) {
     renderMetroMap();
-    refreshSelectedRouteJourney(); // Refresh schedule directly without touching input fields
+    refreshSelectedRouteJourney(); // Refresh schedule directly without wiping route state
   }
 
   if ('geolocation' in navigator && isTracking) {
     navigator.geolocation.getCurrentPosition(
-      (position) => {
-        if (!position || !position.coords) return;
-        const userLat = position.coords.latitude;
-        const userLng = position.coords.longitude;
-        if (userLat == null || userLng == null) return;
-
-        let nearestStation = null;
-        let minDistance = Infinity;
-
-        for (const [station, coords] of Object.entries(STATIONS)) {
-          if (!coords || coords.lat == null || coords.lng == null) continue;
-          const dist = getDistanceInKm(userLat, userLng, coords.lat, coords.lng);
-          if (dist < minDistance) {
-            minDistance = dist;
-            nearestStation = station;
-          }
-        }
-
-        if (nearestStation) {
-          const nearestChanged = nearestStation !== currentNearestStation;
-          currentNearestStation = nearestStation;
-          currentNearestStationDistanceMeters = minDistance * 1000;
-          const distanceLabel = getDistanceLabel(currentNearestStationDistanceMeters);
-
-          // Update strictly non-input elements (status badge, map markers, journey schedule)
-          updateLiveDistanceStatus(distanceLabel, nearestStation);
-          renderMetroMap();
-          
-          if (nearestChanged || currentRoutePath.length > 1) {
-            updateCurrentRouteScheduleFromSelection();
-          }
-        }
-      },
+      (position) => applyDetectedPosition(position, document.getElementById('gps-status')),
       () => {},
       { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 }
     );
@@ -1729,10 +1689,7 @@ document.addEventListener('DOMContentLoaded', () => {
     toggleCheckbox.addEventListener('change', (e) => {
       if (e.target.checked) {
         setFromStationSource('live');
-        const toInput = document.getElementById('to-input');
-        const hasToSelection = Boolean(toInput && toInput.value.trim() !== '');
-        
-        if (currentNearestStation && !hasToSelection) {
+        if (currentNearestStation) {
           syncFromFieldWithLiveLocation(currentNearestStation, true);
         }
       } else {
