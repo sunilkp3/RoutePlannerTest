@@ -1076,13 +1076,18 @@ function applyDetectedPosition(position, statusDiv) {
     const fromInput = document.getElementById('from-input');
     const toInput = document.getElementById('to-input');
 
-    if (fromStationSource === 'live') {
+    // Check if the 'To' station field already contains a value
+    const destination = normalizeStationName(toInput?.value || '');
+    const isToFilled = destination && STATIONS[destination];
+
+    if (fromStationSource === 'live' && !isToFilled) {
+      // Only auto-update the 'From' field if 'To' is NOT filled
       syncFromFieldWithLiveLocation(nearestStation, false);
-      const destination = normalizeStationName(toInput?.value || '');
-      if (!STATIONS[destination]) renderUnselectedDualDirections(nearestStation);
+      renderUnselectedDualDirections(nearestStation);
       updateRouteFromInputs(true);
       updateLiveDistanceStatus(distanceLabel, nearestStation);
     } else {
+      // Update status text without overwriting the 'From' station field
       updateLiveDistanceStatus(distanceLabel, nearestStation);
     }
 
