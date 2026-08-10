@@ -25,6 +25,14 @@ let selectedTrainTimestamp = null; // Remembers exact departure time across refr
 const JOURNEY_REFRESH_INTERVAL_MS = 15000;
 const INSIDE_STATION_THRESHOLD_METERS = 200;
 
+// Destination Alarm State
+const DESTINATION_ALARM_KEY = 'namma_metro_destination_alarm_active';
+const DESTINATION_ALARM_THRESHOLD_METERS = 1000; // Triggers when within 800m of destination[cite: 3]
+let isDestinationAlarmSet = localStorage.getItem(DESTINATION_ALARM_KEY) === 'true';
+let alarmTriggered = false;
+let alarmAudioContext = null;
+let alarmIntervalId = null;
+
 const STATIONS = {
   // PURPLE LINE
   "Challaghatta": { line: "Purple Line", order: 1, lat: 12.8974200, lng: 77.4612400 },
@@ -896,6 +904,7 @@ function updatePanelVisibility() {
   if (mapBtn) mapBtn.classList.toggle('active', activeView === 'map');
 }
 
+// In calculateRoute(), update updateAlarmButtonUI() call without appending new buttons dynamically:
 function calculateRoute(isGpsUpdate = false) {
   const fromInput = document.getElementById('from-input');
   const toInput = document.getElementById('to-input');
@@ -933,6 +942,7 @@ function calculateRoute(isGpsUpdate = false) {
   if (routeChanged && !isGpsUpdate) {
     selectedTrainIndex = 0;
     selectedTrainTimestamp = null;
+    alarmTriggered = false; // Reset trigger state so the alarm can sound for the new destination
   }
 
   if (!isGpsUpdate) requestLeafletAutoFit(true);
@@ -953,6 +963,8 @@ function calculateRoute(isGpsUpdate = false) {
   if (metricFare) metricFare.innerText = `₹${calculatedFare}`;
   if (metricTime) metricTime.innerText = `~${Math.round(estTimeMinutes)} mins`;
   if (metricStops) metricStops.innerText = totalStops;
+
+  updateAlarmButtonUI();
 
   const firstPlatInfo = getPlatformDetails(path[0], path[1]);
   const schedules = getMultipleUpcomingTrainArrivals(firstPlatInfo, 5);
@@ -1073,6 +1085,9 @@ function applyDetectedPosition(position, statusDiv) {
     } else {
       updateLiveDistanceStatus(distanceLabel, nearestStation);
     }
+
+    // CHECK DESTINATION ALARM PROXIMITY HERE
+    checkDestinationAlarm(currentNearestStation, currentNearestStationDistanceMeters);
 
     if (nearestChanged) {
       renderMetroMap();
@@ -1494,7 +1509,7 @@ function setupAutocomplete(inputId, resultsId, helperId) {
           renderUnselectedDualDirections(st);
           if (helper) helper.innerText = `Boarding station set to ${st}.`;
         } else {
-          if (helper) helper.innerText = `Destination station set to ${st}.`;
+          updateDestinationHelperLabel(); // Automatically appends the 800m alarm text if set[cite: 3]
         }
 
         requestLeafletAutoFit(true);
@@ -1718,3 +1733,147 @@ document.addEventListener('DOMContentLoaded', () => {
 
   startGPSLiveTracking();
 });
+
+function initAudioContext() {
+  if (!alarmAudioContext) {
+    alarmAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (alarmAudioContext.state === 'suspended') {
+    alarmAudioContext.resume();
+  }
+}
+
+function playAlarmSound() {
+  initAudioContext();
+  if (alarmIntervalId) return;
+
+  const beep = () => {
+    if (!alarmAudioContext) return;
+    const osc = alarmAudioContext.createOscillator();
+    const gain = alarmAudioContext.createGain();
+    osc.connect(gain);
+    gain.connect(alarmAudioContext.destination);
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(880, alarmAudioContext.currentTime); // A5 tone
+    gain.gain.setValueAtTime(0.4, alarmAudioContext.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, alarmAudioContext.currentTime + 0.4);
+    osc.start();
+    osc.stop(alarmAudioContext.currentTime + 0.4);
+  };
+
+  beep();
+  alarmIntervalId = setInterval(beep, 800);
+}
+
+function stopAlarmSound() {
+  if (alarmIntervalId) {
+    clearInterval(alarmIntervalId);
+    alarmIntervalId = null;
+  }
+}
+
+function toggleDestinationAlarm() {
+  isDestinationAlarmSet = !isDestinationAlarmSet;
+  localStorage.setItem(DESTINATION_ALARM_KEY, String(isDestinationAlarmSet));
+
+  if (isDestinationAlarmSet) {
+    initAudioContext(); // Pre-initialize audio on user gesture
+    alarmTriggered = false;
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  } else {
+    stopAlarmSound();
+  }
+
+  updateAlarmButtonUI();
+  updateDestinationHelperLabel(); // Refresh label message when alarm status changes
+}
+
+function updateDestinationHelperLabel() {
+  const toInput = document.getElementById('to-input');
+  const helper = document.getElementById('to-source-helper');
+  if (!toInput || !helper) return;
+
+  const destination = normalizeStationName(toInput.value);
+  if (!destination || !STATIONS[destination]) return;
+
+  let baseMessage = `Destination station set to ${destination}.`;
+  
+  if (isDestinationAlarmSet) {
+    baseMessage += ` (Alarm will be triggered ${DESTINATION_ALARM_THRESHOLD_METERS} meters before station)`;
+  }
+
+  helper.innerText = baseMessage;
+}
+
+function checkDestinationAlarm(nearestStation, distanceMeters) {
+  if (!isDestinationAlarmSet || alarmTriggered) return;
+  if (!currentRoutePath || !Array.isArray(currentRoutePath) || currentRoutePath.length < 2) return;
+
+  const destinationStation = currentRoutePath[currentRoutePath.length - 1];
+
+  // Triggers only when approaching destination station within 800m threshold[cite: 3]
+  if (nearestStation === destinationStation && distanceMeters <= DESTINATION_ALARM_THRESHOLD_METERS) {
+    triggerDestinationAlarm(destinationStation);
+  }
+}
+
+function triggerDestinationAlarm(stationName) {
+  alarmTriggered = true;
+  playAlarmSound();
+
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("Namma Metro Alert 🚆", {
+      body: `Approaching destination station: ${stationName}! Get ready to disembark.`,
+      requireInteraction: true
+    });
+  }
+
+  showAlarmModal(stationName);
+}
+
+function showAlarmModal(stationName) {
+  let modal = document.getElementById('destination-alarm-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'destination-alarm-modal';
+    modal.className = 'alarm-modal';
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML = `
+    <div class="alarm-modal-content">
+      <div class="alarm-icon">🔔</div>
+      <h2>Approaching Destination!</h2>
+      <p>You are approaching <strong>${stationName}</strong>. Please prepare to exit the train.</p>
+      <button type="button" class="dismiss-alarm-btn" id="dismiss-alarm-btn">Dismiss Alarm</button>
+    </div>
+  `;
+  modal.style.display = 'flex';
+
+  document.getElementById('dismiss-alarm-btn')?.addEventListener('click', dismissDestinationAlarm);
+}
+
+function dismissDestinationAlarm() {
+  stopAlarmSound();
+  isDestinationAlarmSet = false;
+  localStorage.setItem(DESTINATION_ALARM_KEY, 'false');
+  alarmTriggered = false;
+  const modal = document.getElementById('destination-alarm-modal');
+  if (modal) modal.style.display = 'none';
+  updateAlarmButtonUI();
+  updateDestinationHelperLabel();
+}
+
+function updateAlarmButtonUI() {
+  const btn = document.getElementById('destination-alarm-btn');
+  if (!btn) return;
+
+  if (isDestinationAlarmSet) {
+    btn.classList.add('alarm-active');
+    btn.innerHTML = '🔔 Alarm Set';
+  } else {
+    btn.classList.remove('alarm-active');
+    btn.innerHTML = '🔕 Set Alarm';
+  }
+}

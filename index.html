@@ -160,7 +160,12 @@
 
     <!-- Destination Field -->
     <div class="form-group">
-      <label for="to-input">To (Destination Station or Place)</label>
+      <div class="destination-header-row">
+        <label for="to-input">To (Destination Station or Place)</label>
+        <button type="button" class="alarm-btn inline-alarm-btn" id="destination-alarm-btn" onclick="toggleDestinationAlarm()">
+          🔕 Set Alarm
+        </button>
+      </div>
       <div class="input-wrapper">
         <input 
           type="text" 
