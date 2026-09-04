@@ -2,7 +2,7 @@ let watchId = null;
 let isTracking = false;
 let currentNearestStation = null;
 let currentNearestStationDistanceMeters = null;
-let currentLiveStatus = null; // 'HERE' | 'APPROACHING' | null
+let currentLiveStatus = null; // 'HERE' | 'LEAVING' | 'APPROACHING' | null
 let currentStationIndexOnRoute = 0; // Index along currentRoutePath
 
 // Device GPS Motion & Vector Tracking
@@ -322,6 +322,17 @@ function calculateBearing(lat1, lon1, lat2, lon2) {
   return (brng + 360) % 360;
 }
 
+function isMovingTowardsStation(previousLat, previousLng, currentLat, currentLng, station) {
+  if (previousLat == null || previousLng == null || !station) return false;
+  const movementMeters = getDistanceInKm(previousLat, previousLng, currentLat, currentLng) * 1000;
+  if (movementMeters < 12) return false;
+
+  const movementBearing = calculateBearing(previousLat, previousLng, currentLat, currentLng);
+  const targetBearing = calculateBearing(currentLat, currentLng, station.lat, station.lng);
+  const bearingDifference = Math.abs(((movementBearing - targetBearing + 540) % 360) - 180);
+  return bearingDifference <= 75;
+}
+
 function getDistanceInKm(lat1, lon1, lat2, lon2) {
   if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return Infinity;
   const R = 6371; // Earth radius in KM
@@ -364,6 +375,8 @@ function getLiveStatusTag(station) {
   if (currentNearestStation !== station || !currentLiveStatus) return '';
   if (currentLiveStatus === 'HERE') {
     return '<span class="live-tag">YOU ARE HERE</span>';
+  } else if (currentLiveStatus === 'LEAVING') {
+    return '<span class="live-tag approaching">LEAVING / APPROACHING</span>';
   } else if (currentLiveStatus === 'APPROACHING') {
     return '<span class="live-tag approaching">APPROACHING</span>';
   }
@@ -1080,6 +1093,11 @@ function updateLiveDistanceStatus(distanceLabel, nearestStation) {
     let statusText = 'Nearest station:';
     if (currentLiveStatus === 'HERE') {
       statusText = 'You are at';
+    } else if (currentLiveStatus === 'LEAVING') {
+      const currentStation = currentRoutePath[currentStationIndexOnRoute];
+      const nextStation = currentRoutePath[currentStationIndexOnRoute + 1] || nearestStation;
+      statusDiv.innerHTML = `Leaving <strong>${currentStation}</strong> and approaching <strong>${nextStation}</strong> (${distanceLabel} away).`;
+      return;
     } else if (currentLiveStatus === 'APPROACHING') {
       statusText = 'Approaching';
     } else {
@@ -1099,6 +1117,8 @@ function applyDetectedPosition(position, statusDiv) {
   const userLat = position.coords.latitude;
   const userLng = position.coords.longitude;
   const currentTime = Date.now();
+  const previousUserLat = lastUserLat;
+  const previousUserLng = lastUserLng;
 
   if (userLat == null || userLng == null) return;
 
@@ -1122,6 +1142,7 @@ function applyDetectedPosition(position, statusDiv) {
     const nextStation = currentRoutePath[nextIdx];
     const nextCoords = STATIONS[nextStation];
     const nextDist = nextCoords ? (getDistanceInKm(userLat, userLng, nextCoords.lat, nextCoords.lng) * 1000) : Infinity;
+    const movingTowardsNext = nextCoords && isMovingTowardsStation(previousUserLat, previousUserLng, userLat, userLng, nextCoords);
 
     if (nextIdx > activeIdx && nextDist <= PROXIMITY_THRESHOLD_METERS) {
       currentStationIndexOnRoute = nextIdx;
@@ -1141,8 +1162,8 @@ function applyDetectedPosition(position, statusDiv) {
       if (currDist <= HERE_THRESHOLD_METERS) {
         computedStatus = 'HERE';
       } else {
-        computedStatus = (nextDist < currDist) ? 'APPROACHING' : 'HERE';
-        if (nextDist < currDist) {
+        computedStatus = movingTowardsNext ? 'LEAVING' : null;
+        if (movingTowardsNext) {
           nearestStation = nextStation;
           minDistanceMeters = nextDist;
         }
@@ -1154,6 +1175,8 @@ function applyDetectedPosition(position, statusDiv) {
 
       if (nextDist <= PROXIMITY_THRESHOLD_METERS) {
         computedStatus = 'APPROACHING';
+      } else if (movingTowardsNext) {
+        computedStatus = 'LEAVING';
       } else {
         computedStatus = null;
       }
@@ -1469,6 +1492,10 @@ function applyMapPickToField(inputId) {
   if (!nearestMatch || !input) return;
 
   input.value = nearestMatch.station;
+  if (inputId === 'to-input') {
+    const destinationClear = document.getElementById('to-clear');
+    if (destinationClear) destinationClear.style.display = 'flex';
+  }
   if (inputId === 'from-input') {
     setFromStationSource('manual');
     if (helper) helper.textContent = `Map location mapped to ${nearestMatch.station} (${getDistanceLabel(nearestMatch.distanceMeters)} away).`;
@@ -1679,7 +1706,11 @@ function setupAutocomplete(inputId, resultsId, helperId) {
   if (!input || !results || !clearBtn) return;
 
   function updateClearButton() {
-    if (inputId === 'from-input' && fromStationSource === 'live') {
+    if (inputId === 'to-input') {
+      clearBtn.style.display = input.value.trim() ? 'flex' : 'none';
+      return;
+    }
+    if (fromStationSource === 'live') {
       clearBtn.style.display = 'none';
       return;
     }
@@ -1905,8 +1936,11 @@ document.addEventListener('DOMContentLoaded', () => {
   setupMapPlaceSearch();
   document.getElementById('choose-to-on-map')?.addEventListener('click', () => {
     setActiveView('map');
-    openMapPickOverlay();
-    document.getElementById('map-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const mapCard = document.getElementById('map-card');
+    requestAnimationFrame(() => {
+      mapCard?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      openMapPickOverlay();
+    });
   });
 
   const toggleCheckbox = document.getElementById('location-toggle');
