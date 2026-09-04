@@ -1185,7 +1185,7 @@ function applyDetectedPosition(position, statusDiv) {
 
     if (fromStationSource === 'live') {
       if (statusChanged && (!currentRoutePath || currentRoutePath.length < 2)) {
-        syncFromFieldWithLiveLocation(nearestStation, false);
+        syncFromFieldWithLiveLocation(nearestStation, true);
       }
       updateLiveDistanceStatus(distanceLabel, nearestStation);
     } else {
