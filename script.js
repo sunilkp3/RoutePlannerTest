@@ -16,6 +16,7 @@ let currentPanel = 'unselected';
 let currentRoutePath = [];
 let leafletMap = null;
 let leafletLayerGroup = null;
+let leafletMapPickLayer = null;
 let leafletBaseLayers = null;
 let lastLeafletRenderKey = '';
 let leafletUserTouched = false;
@@ -25,6 +26,7 @@ let leafletAutoFitRequested = true;
 // Track selected mapped station objects for From/To
 let mappedFromStation = null;
 let mappedToStation = null;
+let selectedMapCoordinates = null;
 
 // Track selected departure train schedule index & timestamp
 let selectedTrainIndex = 0;
@@ -1362,6 +1364,8 @@ function initLeafletMap() {
     leafletBaseLayers = { 'Street map': street, 'Satellite': satellite };
     L.control.layers(leafletBaseLayers, null, { position: 'topright' }).addTo(leafletMap);
     leafletLayerGroup = L.layerGroup().addTo(leafletMap);
+    leafletMapPickLayer = L.layerGroup().addTo(leafletMap);
+    leafletMap.on('click', handleLeafletMapPick);
     leafletMap.on('dragstart zoomstart', () => {
       if (!leafletProgrammaticFit) leafletUserTouched = true;
     });
@@ -1371,6 +1375,113 @@ function initLeafletMap() {
     console.error("Leaflet initialization error:", e);
     return false;
   }
+}
+
+function hideMapPickOverlay() {
+  const overlay = document.getElementById('map-pick-overlay');
+  if (overlay) overlay.hidden = true;
+  selectedMapCoordinates = null;
+  if (leafletMapPickLayer) leafletMapPickLayer.clearLayers();
+}
+
+function openMapPickOverlay() {
+  const overlay = document.getElementById('map-pick-overlay');
+  const coordinates = document.getElementById('map-pick-coordinates');
+  const station = document.getElementById('map-pick-station');
+  if (!overlay) return;
+  overlay.hidden = false;
+  if (coordinates) coordinates.textContent = 'Search a place or click anywhere on the map';
+  if (station) station.textContent = 'Select a result to find its nearest metro station.';
+  document.getElementById('map-place-search')?.focus();
+}
+
+function showMapPickOverlay(lat, lng, nearestMatch) {
+  const overlay = document.getElementById('map-pick-overlay');
+  const coordinates = document.getElementById('map-pick-coordinates');
+  const station = document.getElementById('map-pick-station');
+  if (!overlay || !coordinates || !station || !nearestMatch) return;
+
+  selectedMapCoordinates = { lat, lng };
+  coordinates.textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+  station.innerHTML = `Nearest metro: <strong>${nearestMatch.station}</strong><span> ${getDistanceLabel(nearestMatch.distanceMeters)} away</span>`;
+  overlay.hidden = false;
+
+  if (leafletMapPickLayer) {
+    leafletMapPickLayer.clearLayers();
+    L.circleMarker([lat, lng], {
+      radius: 7,
+      color: '#ffffff',
+      weight: 3,
+      fillColor: '#ff375f',
+      fillOpacity: 1
+    }).addTo(leafletMapPickLayer);
+  }
+}
+
+function handleLeafletMapPick(event) {
+  if (!event || !event.latlng) return;
+  const nearestMatch = findNearestStationForCoordinates(event.latlng.lat, event.latlng.lng);
+  if (nearestMatch) showMapPickOverlay(event.latlng.lat, event.latlng.lng, nearestMatch);
+}
+
+function selectMapPlace(place) {
+  const lat = parseFloat(place?.lat);
+  const lng = parseFloat(place?.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || !leafletMap) return;
+
+  const nearestMatch = findNearestStationForCoordinates(lat, lng);
+  if (!nearestMatch) return;
+  leafletMap.setView([lat, lng], Math.max(leafletMap.getZoom(), 15), { animate: true });
+  showMapPickOverlay(lat, lng, nearestMatch);
+  const results = document.getElementById('map-place-results');
+  if (results) results.innerHTML = '';
+}
+
+function setupMapPlaceSearch() {
+  const input = document.getElementById('map-place-search');
+  const results = document.getElementById('map-place-results');
+  if (!input || !results) return;
+
+  const search = debounce(async () => {
+    const query = input.value.trim();
+    results.innerHTML = '';
+    if (query.length < 3) return;
+
+    const places = await searchOSMPlaces(query, true);
+    places.forEach((place) => {
+      const result = document.createElement('button');
+      result.type = 'button';
+      result.className = 'map-place-result';
+      result.textContent = place.display_name || query;
+      result.addEventListener('click', () => selectMapPlace(place));
+      results.appendChild(result);
+    });
+  }, 450);
+
+  input.addEventListener('input', search);
+}
+
+function applyMapPickToField(inputId) {
+  if (!selectedMapCoordinates) return;
+  const nearestMatch = findNearestStationForCoordinates(selectedMapCoordinates.lat, selectedMapCoordinates.lng);
+  const input = document.getElementById(inputId);
+  const helper = document.getElementById(inputId === 'from-input' ? 'from-source-helper' : 'to-source-helper');
+  if (!nearestMatch || !input) return;
+
+  input.value = nearestMatch.station;
+  if (inputId === 'from-input') {
+    setFromStationSource('manual');
+    if (helper) helper.textContent = `Map location mapped to ${nearestMatch.station} (${getDistanceLabel(nearestMatch.distanceMeters)} away).`;
+    renderUnselectedDualDirections(nearestMatch.station);
+  } else {
+    stopActiveAlarm();
+    if (helper) helper.textContent = `Map location mapped to ${nearestMatch.station} (${getDistanceLabel(nearestMatch.distanceMeters)} away).`;
+  }
+
+  hideMapPickOverlay();
+  requestLeafletAutoFit(true);
+  updateRouteFromInputs(false);
+  updateCurrentRouteScheduleFromSelection();
 }
 
 function renderLeafletMetroMap() {
@@ -1786,6 +1897,17 @@ function refreshJourneyView() {
 document.addEventListener('DOMContentLoaded', () => {
   setupAutocomplete('from-input', 'from-results', 'from-source-helper');
   setupAutocomplete('to-input', 'to-results', 'to-source-helper');
+
+  document.getElementById('map-pick-from')?.addEventListener('click', () => applyMapPickToField('from-input'));
+  document.getElementById('map-pick-to')?.addEventListener('click', () => applyMapPickToField('to-input'));
+  document.getElementById('map-pick-dismiss')?.addEventListener('click', hideMapPickOverlay);
+  document.getElementById('map-pick-overlay')?.addEventListener('click', (event) => event.stopPropagation());
+  setupMapPlaceSearch();
+  document.getElementById('choose-to-on-map')?.addEventListener('click', () => {
+    setActiveView('map');
+    openMapPickOverlay();
+    document.getElementById('map-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 
   const toggleCheckbox = document.getElementById('location-toggle');
   if (toggleCheckbox) {

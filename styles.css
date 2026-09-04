@@ -218,6 +218,19 @@ body {
   margin-bottom: 2px;
 }
 
+.destination-actions { display: flex; align-items: center; gap: 6px; }
+
+.map-picker-btn {
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .inline-alarm-btn {
   margin-top: 0 !important;
   width: auto !important;
@@ -496,6 +509,38 @@ input[readonly] { cursor: default; }
   box-shadow: var(--card-shadow);
   backdrop-filter: blur(26px);
 }
+
+.metro-map-wrap { position: relative; }
+
+.map-pick-overlay {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  z-index: 700;
+  width: min(330px, calc(100% - 28px));
+  padding: 12px;
+  border: 1px solid var(--accent-border-strong);
+  border-radius: 12px;
+  background: var(--dropdown-bg);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
+}
+
+.map-pick-overlay[hidden] { display: none; }
+.map-pick-kicker { color: var(--accent); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; }
+.map-pick-search { position: relative; margin-top: 8px; }
+.map-pick-search input { padding: 9px 10px; border-radius: 8px; font-size: 0.8rem; }
+.map-place-results { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 2; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--dropdown-bg); box-shadow: var(--dropdown-shadow); }
+.map-place-results:empty { display: none; }
+.map-place-result { display: block; width: 100%; padding: 8px 10px; border: 0; border-bottom: 1px solid var(--border); background: transparent; color: var(--text); text-align: left; font-size: 0.76rem; line-height: 1.3; cursor: pointer; }
+.map-place-result:last-child { border-bottom: 0; }
+.map-place-result:hover, .map-place-result:focus { background: var(--surface-hover); outline: none; }
+.map-pick-coordinates { margin-top: 4px; color: var(--text-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+.map-pick-station { margin-top: 7px; color: var(--text); font-size: 0.84rem; line-height: 1.35; padding-right: 20px; }
+.map-pick-station span { color: var(--text-muted); }
+.map-pick-actions { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+.map-pick-actions button { border: 0; border-radius: 8px; padding: 7px 9px; background: var(--accent); color: #fff; font-size: 0.72rem; font-weight: 800; cursor: pointer; }
+.map-pick-actions .map-pick-dismiss { margin-left: auto; padding: 4px 8px; background: transparent; color: var(--text-muted); font-size: 1.1rem; }
 
 .map-toolbar {
   display: flex;
