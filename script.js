@@ -1517,6 +1517,10 @@ function applyMapPickToField(inputId) {
   requestLeafletAutoFit(true);
   updateRouteFromInputs(false);
   updateCurrentRouteScheduleFromSelection();
+  setActiveView('journey');
+  requestAnimationFrame(() => {
+    input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
 }
 
 function renderLeafletMetroMap() {
