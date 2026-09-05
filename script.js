@@ -372,11 +372,19 @@ function findNearestStationForCoordinates(lat, lng) {
 
 // Render dynamic status tag for timeline steps
 function getLiveStatusTag(station) {
-  if (currentNearestStation !== station || !currentLiveStatus) return '';
+  if (!currentLiveStatus) return '';
+  const activeStation = currentRoutePath[currentStationIndexOnRoute];
+  const nextStation = currentRoutePath[currentStationIndexOnRoute + 1];
+
+  if (currentLiveStatus === 'LEAVING' && station === activeStation) {
+    return '<span class="live-tag approaching">LEAVING</span>';
+  }
+  if (currentLiveStatus === 'LEAVING' && station === nextStation) {
+    return '<span class="live-tag approaching">APPROACHING</span>';
+  }
+  if (currentNearestStation !== station) return '';
   if (currentLiveStatus === 'HERE') {
     return '<span class="live-tag">YOU ARE HERE</span>';
-  } else if (currentLiveStatus === 'LEAVING') {
-    return '<span class="live-tag approaching">LEAVING / APPROACHING</span>';
   } else if (currentLiveStatus === 'APPROACHING') {
     return '<span class="live-tag approaching">APPROACHING</span>';
   }
@@ -2013,20 +2021,27 @@ function playAlarmSound() {
 
   const beep = () => {
     if (!alarmAudioContext) return;
-    const osc = alarmAudioContext.createOscillator();
-    const gain = alarmAudioContext.createGain();
-    osc.connect(gain);
-    gain.connect(alarmAudioContext.destination);
-    osc.type = 'triangle';
-    osc.frequency.setValueAtTime(880, alarmAudioContext.currentTime); // A5 tone
-    gain.gain.setValueAtTime(0.4, alarmAudioContext.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, alarmAudioContext.currentTime + 0.4);
-    osc.start();
-    osc.stop(alarmAudioContext.currentTime + 0.4);
+    const startTime = alarmAudioContext.currentTime;
+    const tone = (frequency, offset = 0) => {
+      const osc = alarmAudioContext.createOscillator();
+      const gain = alarmAudioContext.createGain();
+      osc.connect(gain);
+      gain.connect(alarmAudioContext.destination);
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(frequency, startTime + offset);
+      gain.gain.setValueAtTime(0.0001, startTime + offset);
+      gain.gain.exponentialRampToValueAtTime(0.8, startTime + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, startTime + offset + 0.28);
+      osc.start(startTime + offset);
+      osc.stop(startTime + offset + 0.3);
+    };
+
+    tone(1046);
+    tone(1318, 0.32);
   };
 
   beep();
-  alarmIntervalId = setInterval(beep, 800);
+  alarmIntervalId = setInterval(beep, 700);
 }
 
 function stopAlarmSound() {

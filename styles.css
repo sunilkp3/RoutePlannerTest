@@ -177,7 +177,8 @@ body {
 }
 
 .alarm-modal-content {
-  background: #ffffff;
+  background: var(--card-bg);
+  color: var(--text);
   padding: 24px;
   border-radius: 16px;
   text-align: center;
@@ -185,6 +186,16 @@ body {
   width: 90%;
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2);
   animation: popIn 0.3s ease;
+}
+
+.alarm-modal-content p {
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+.alarm-modal-content strong {
+  color: var(--text);
 }
 
 .alarm-icon {
